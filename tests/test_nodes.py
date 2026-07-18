@@ -139,8 +139,20 @@ def test_node_model_details_include_urls_and_owner(tmp_path: Path, monkeypatch) 
             json={
                 "object": "list",
                 "data": [
-                    {"id": "auto", "owned_by": "router"},
-                    {"id": "free-model", "owned_by": "upstream"},
+                    {
+                        "id": "auto",
+                        "owned_by": "router",
+                        "provider": "LLM Router",
+                        "upstream_base_url": None,
+                        "upstream_chat_url": None,
+                    },
+                    {
+                        "id": "free-model",
+                        "owned_by": "finna",
+                        "provider": "Finna",
+                        "upstream_base_url": "https://www.finna.com.cn/v1",
+                        "upstream_chat_url": "https://www.finna.com.cn/v1/chat/completions",
+                    },
                 ],
             },
         )
@@ -167,17 +179,52 @@ def test_node_model_details_include_urls_and_owner(tmp_path: Path, monkeypatch) 
             {
                 "id": "auto",
                 "owned_by": "router",
+                "provider": "LLM Router",
+                "upstream_base_url": None,
+                "upstream_chat_url": None,
+                "access_base_url": "https://free.example/v1",
+                "access_chat_url": "https://free.example/v1/chat/completions",
                 "request_url": "https://free.example/v1/chat/completions",
                 "automatic": True,
             },
             {
                 "id": "free-model",
-                "owned_by": "upstream",
-                "request_url": "https://free.example/v1/chat/completions",
+                "owned_by": "finna",
+                "provider": "Finna",
+                "upstream_base_url": "https://www.finna.com.cn/v1",
+                "upstream_chat_url": "https://www.finna.com.cn/v1/chat/completions",
+                "access_base_url": "https://free.example/v1",
+                "access_chat_url": "https://free.example/v1/chat/completions",
+                "request_url": "https://www.finna.com.cn/v1/chat/completions",
                 "automatic": False,
             },
         ],
     }
+
+
+def test_node_model_details_fall_back_for_standard_openai_response(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("DAMSELFISH_API_KEY", "service-secret")
+    headers = {"Authorization": "Bearer service-secret"}
+
+    async def upstream(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"object": "list", "data": [{"id": "free-model", "owned_by": "cloud"}]},
+        )
+
+    app = create_app(config(tmp_path))
+    with TestClient(app) as client:
+        client.post("/admin/api/nodes", headers=headers, json=node_payload())
+        app.state.router.client = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
+        response = client.get("/admin/api/nodes/free-cloud/models", headers=headers)
+
+    model = response.json()["model_details"][0]
+    assert model["provider"] == "cloud"
+    assert model["upstream_base_url"] == "https://free.example/v1"
+    assert model["upstream_chat_url"] == "https://free.example/v1/chat/completions"
+    assert model["access_chat_url"] == "https://free.example/v1/chat/completions"
 
 
 def test_node_model_discovery_failure_does_not_break_node_list(

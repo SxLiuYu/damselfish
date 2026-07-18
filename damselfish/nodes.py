@@ -218,16 +218,33 @@ async def discover_models(client: httpx.AsyncClient, target: TargetConfig) -> di
             }
         body = response.json()
         data = body.get("data", []) if isinstance(body, dict) else []
-        model_details = [
-            {
-                "id": str(item["id"]),
-                "owned_by": str(item.get("owned_by", "unknown")),
-                "request_url": target.chat_url,
-                "automatic": str(item["id"]) == "auto",
-            }
-            for item in data
-            if isinstance(item, dict) and item.get("id")
-        ][:500]
+        model_details = []
+        for item in data:
+            if not isinstance(item, dict) or not item.get("id"):
+                continue
+            model_id = str(item["id"])
+            automatic = model_id == "auto"
+            upstream_base_url = _optional_url(item.get("upstream_base_url"))
+            upstream_chat_url = _optional_url(
+                item.get("upstream_chat_url"), preserve_path=True
+            )
+            if not automatic:
+                upstream_base_url = upstream_base_url or base
+                upstream_chat_url = upstream_chat_url or target.chat_url
+            owned_by = str(item.get("owned_by", "unknown"))
+            model_details.append({
+                "id": model_id,
+                "owned_by": owned_by,
+                "provider": str(item.get("provider") or owned_by),
+                "upstream_base_url": upstream_base_url,
+                "upstream_chat_url": upstream_chat_url,
+                "access_base_url": base,
+                "access_chat_url": target.chat_url,
+                "request_url": upstream_chat_url or target.chat_url,
+                "automatic": automatic,
+            })
+            if len(model_details) == 500:
+                break
         return {
             "success": True,
             "status": response.status_code,
@@ -262,6 +279,16 @@ def _validate_base_url(value: str) -> str:
     if url.endswith("/chat/completions"):
         url = url[: -len("/chat/completions")]
     return url.rstrip("/")
+
+
+def _optional_url(value: Any, *, preserve_path: bool = False) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        normalized = _validate_base_url(value.strip())
+    except NodeValidationError:
+        return None
+    return value.strip().rstrip("/") if preserve_path else normalized
 
 
 def _string_list(value: Any, name: str) -> list[str]:
