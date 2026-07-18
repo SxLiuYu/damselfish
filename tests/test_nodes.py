@@ -125,3 +125,79 @@ def test_edit_keeps_existing_upstream_key(tmp_path: Path, monkeypatch) -> None:
     assert response.status_code == 200
     assert response.json()["data"]["label"] == "Renamed"
     assert "upstream-secret" in (tmp_path / "managed-nodes.json").read_text()
+
+
+def test_node_model_details_include_urls_and_owner(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("DAMSELFISH_API_KEY", "service-secret")
+    headers = {"Authorization": "Bearer service-secret"}
+
+    async def upstream(request: httpx.Request) -> httpx.Response:
+        assert request.url == "https://free.example/v1/models"
+        assert request.headers["authorization"] == "Bearer upstream-secret"
+        return httpx.Response(
+            200,
+            json={
+                "object": "list",
+                "data": [
+                    {"id": "auto", "owned_by": "router"},
+                    {"id": "free-model", "owned_by": "upstream"},
+                ],
+            },
+        )
+
+    app = create_app(config(tmp_path))
+    with TestClient(app) as client:
+        client.post("/admin/api/nodes", headers=headers, json=node_payload())
+        app.state.router.client = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
+        listed = client.get("/admin/api/nodes", headers=headers)
+        response = client.get("/admin/api/nodes/free-cloud/models", headers=headers)
+
+    node = next(item for item in listed.json()["data"] if item["id"] == "free-cloud")
+    assert node["models_url"] == "https://free.example/v1/models"
+    assert node["chat_url"] == "https://free.example/v1/chat/completions"
+    assert response.status_code == 200
+    assert response.json() == {
+        "success": True,
+        "status": 200,
+        "latency_ms": response.json()["latency_ms"],
+        "models_url": "https://free.example/v1/models",
+        "chat_url": "https://free.example/v1/chat/completions",
+        "models": ["auto", "free-model"],
+        "model_details": [
+            {
+                "id": "auto",
+                "owned_by": "router",
+                "request_url": "https://free.example/v1/chat/completions",
+                "automatic": True,
+            },
+            {
+                "id": "free-model",
+                "owned_by": "upstream",
+                "request_url": "https://free.example/v1/chat/completions",
+                "automatic": False,
+            },
+        ],
+    }
+
+
+def test_node_model_discovery_failure_does_not_break_node_list(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("DAMSELFISH_API_KEY", "service-secret")
+    headers = {"Authorization": "Bearer service-secret"}
+
+    async def upstream(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"detail": "Not Found"})
+
+    app = create_app(config(tmp_path))
+    with TestClient(app) as client:
+        client.post("/admin/api/nodes", headers=headers, json=node_payload())
+        app.state.router.client = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
+        models = client.get("/admin/api/nodes/free-cloud/models", headers=headers)
+        listed = client.get("/admin/api/nodes", headers=headers)
+
+    assert models.status_code == 200
+    assert models.json()["success"] is False
+    assert models.json()["status"] == 404
+    assert listed.status_code == 200
+    assert any(item["id"] == "free-cloud" for item in listed.json()["data"])

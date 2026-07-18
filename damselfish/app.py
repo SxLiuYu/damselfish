@@ -176,6 +176,13 @@ def create_app(config: AppConfig | None = None, config_path: str | Path | None =
             raise HTTPException(status_code=400, detail=str(error)) from error
         return await discover_models(request.app.state.router.client, target)
 
+    @app.get("/admin/api/nodes/{node_id}/models")
+    async def node_models(node_id: str, request: Request) -> dict[str, Any]:
+        target = next((item for item in loaded.targets if item.id == node_id), None)
+        if target is None:
+            raise HTTPException(status_code=404, detail="节点不存在")
+        return await discover_models(request.app.state.router.client, target)
+
     @app.post("/admin/api/nodes", status_code=201)
     async def create_node(request: Request) -> dict[str, Any]:
         payload = await _json_object(request)

@@ -128,10 +128,13 @@ def draft_target(payload: dict[str, Any], existing: dict[str, Any] | None = None
 
 
 def public_node(target: TargetConfig, *, managed: bool) -> dict[str, Any]:
+    base_url = target.base_url.rstrip("/")
     return {
         "id": target.id,
         "label": target.label,
-        "base_url": target.base_url,
+        "base_url": base_url,
+        "models_url": f"{base_url}/models",
+        "chat_url": target.chat_url,
         "model": target.model,
         "enabled": target.enabled,
         "available": target.available,
@@ -204,7 +207,7 @@ async def discover_models(client: httpx.AsyncClient, target: TargetConfig) -> di
     models_url = f"{base}/models"
     started = time.monotonic()
     try:
-        response = await client.get(models_url, headers=headers)
+        response = await client.get(models_url, headers=headers, timeout=10.0)
         latency_ms = (time.monotonic() - started) * 1000
         if not response.is_success:
             return {
@@ -215,12 +218,24 @@ async def discover_models(client: httpx.AsyncClient, target: TargetConfig) -> di
             }
         body = response.json()
         data = body.get("data", []) if isinstance(body, dict) else []
-        models = [str(item["id"]) for item in data if isinstance(item, dict) and item.get("id")]
+        model_details = [
+            {
+                "id": str(item["id"]),
+                "owned_by": str(item.get("owned_by", "unknown")),
+                "request_url": target.chat_url,
+                "automatic": str(item["id"]) == "auto",
+            }
+            for item in data
+            if isinstance(item, dict) and item.get("id")
+        ][:500]
         return {
             "success": True,
             "status": response.status_code,
             "latency_ms": round(latency_ms, 1),
-            "models": models[:500],
+            "models_url": models_url,
+            "chat_url": target.chat_url,
+            "models": [model["id"] for model in model_details],
+            "model_details": model_details,
         }
     except httpx.TimeoutException:
         return {"success": False, "status": 504, "message": "连接或响应超时"}
