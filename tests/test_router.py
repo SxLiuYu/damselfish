@@ -45,3 +45,53 @@ def test_router_falls_back_after_rate_limit(tmp_path: Path) -> None:
     assert store.stats("first").rate_limits == 1
     assert store.stats("first").circuit_open_until > 0
     store.close()
+
+
+def test_router_accepts_reasoning_only_response(tmp_path: Path) -> None:
+    config = AppConfig(
+        host="127.0.0.1",
+        port=8086,
+        database=tmp_path / "test.db",
+        routing=RoutingConfig(),
+        targets=(
+            TargetConfig(
+                "reasoning",
+                "Reasoning",
+                "http://router/v1",
+                "reasoning-model",
+                local=False,
+            ),
+        ),
+    )
+    store = Store(config.database, ["reasoning"])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "",
+                            "reasoning_content": "OK",
+                        },
+                        "finish_reason": "stop",
+                    }
+                ]
+            },
+        )
+
+    async def run() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            router = ModelRouter(config, store, client)
+            result = await router.complete(
+                {"model": "auto", "messages": [{"role": "user", "content": "hello"}]},
+                RouteContext("default", None, frozenset(), frozenset(), ()),
+                "test",
+            )
+            assert result.body["choices"][0]["message"]["reasoning_content"] == "OK"
+
+    asyncio.run(run())
+    assert store.stats("reasoning").successes == 1
+    store.close()

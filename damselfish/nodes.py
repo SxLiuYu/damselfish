@@ -164,7 +164,7 @@ async def test_node(client: httpx.AsyncClient, target: TargetConfig) -> dict[str
                 "model": target.model,
                 "messages": [{"role": "user", "content": "仅回复 OK"}],
                 "stream": False,
-                "max_tokens": 16,
+                "max_tokens": 256,
                 "temperature": 0,
             },
         )
@@ -179,24 +179,50 @@ async def test_node(client: httpx.AsyncClient, target: TargetConfig) -> dict[str
         body = response.json()
         if isinstance(body.get("data"), dict):
             body = body["data"]
-        choices = body.get("choices", [])
-        message = choices[0].get("message", {}) if choices else {}
+        if not isinstance(body, dict):
+            raise ValueError("响应不是 JSON 对象")
+        choices = body.get("choices")
+        if not isinstance(choices, list) or not choices:
+            raise ValueError("响应中没有 choices")
+        choice = choices[0]
+        if not isinstance(choice, dict):
+            raise ValueError("响应中的 choice 格式无效")
+        message = choice.get("message")
+        if not isinstance(message, dict):
+            raise ValueError("响应中没有 assistant 消息")
         content = message.get("content")
-        if not content and message.get("tool_calls"):
-            content = "已返回工具调用"
-        if not choices or not (content or message.get("tool_calls")):
+        tool_calls = message.get("tool_calls")
+        function_call = message.get("function_call")
+        reasoning_content = message.get("reasoning_content")
+        if not (content or tool_calls or function_call or reasoning_content):
             raise ValueError("响应中没有可用的 assistant 消息")
+        if content:
+            result_message = str(content)
+        elif tool_calls or function_call:
+            result_message = "已返回工具调用"
+        else:
+            result_message = "已返回推理内容"
         return {
             "success": True,
             "status": response.status_code,
             "latency_ms": round(latency_ms, 1),
             "model": body.get("model", target.model),
-            "message": str(content or "已返回工具调用")[:300],
+            "message": result_message[:300],
         }
     except httpx.TimeoutException:
-        return {"success": False, "status": 504, "message": "连接或响应超时"}
+        return {
+            "success": False,
+            "status": 504,
+            "latency_ms": round((time.monotonic() - started) * 1000, 1),
+            "message": "连接或响应超时",
+        }
     except (httpx.HTTPError, ValueError, TypeError, json.JSONDecodeError) as error:
-        return {"success": False, "status": 502, "message": f"上游响应无效：{str(error)[:300]}"}
+        return {
+            "success": False,
+            "status": 502,
+            "latency_ms": round((time.monotonic() - started) * 1000, 1),
+            "message": f"上游响应无效：{str(error)[:300]}",
+        }
 
 
 async def discover_models(client: httpx.AsyncClient, target: TargetConfig) -> dict[str, Any]:

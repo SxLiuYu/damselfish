@@ -222,9 +222,14 @@ def _validate_completion(body: Any) -> None:
     message = choices[0].get("message")
     if not isinstance(message, dict):
         raise ValueError("response has no assistant message")
-    usable = message.get("content") or message.get("tool_calls") or message.get("function_call")
+    usable = (
+        message.get("content")
+        or message.get("tool_calls")
+        or message.get("function_call")
+        or message.get("reasoning_content")
+    )
     if not usable:
-        raise ValueError("assistant message has no usable content or tool call")
+        raise ValueError("assistant message has no usable content, reasoning, or tool call")
 
 
 def _error_message(response: httpx.Response) -> str:

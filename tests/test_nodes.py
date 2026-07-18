@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from typing import Any
 
@@ -110,6 +111,68 @@ def test_node_test_save_reload_and_delete(tmp_path: Path, monkeypatch) -> None:
     assert deleted.json()["deleted"] is True
     saved = (tmp_path / "managed-nodes.json").read_text(encoding="utf-8")
     assert "free-cloud" not in saved
+
+
+def test_node_test_accepts_reasoning_content(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("DAMSELFISH_API_KEY", "service-secret")
+
+    async def upstream(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        assert payload["max_tokens"] >= 128
+        return httpx.Response(
+            200,
+            json={
+                "model": "reasoning-model",
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {
+                            "role": "assistant",
+                            "content": "",
+                            "reasoning_content": "OK",
+                        },
+                    }
+                ],
+            },
+        )
+
+    app = create_app(config(tmp_path))
+    with TestClient(app) as client:
+        app.state.router.client = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
+        response = client.post(
+            "/admin/api/nodes/test",
+            headers={"Authorization": "Bearer service-secret"},
+            json=node_payload(),
+        )
+
+    result = response.json()
+    assert result["success"] is True
+    assert result["message"] == "已返回推理内容"
+    assert result["latency_ms"] >= 0
+
+
+def test_node_test_failure_includes_latency(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("DAMSELFISH_API_KEY", "service-secret")
+
+    async def upstream(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"role": "assistant", "content": ""}}]},
+        )
+
+    app = create_app(config(tmp_path))
+    with TestClient(app) as client:
+        app.state.router.client = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
+        response = client.post(
+            "/admin/api/nodes/test",
+            headers={"Authorization": "Bearer service-secret"},
+            json=node_payload(),
+        )
+
+    result = response.json()
+    assert result["success"] is False
+    assert result["status"] == 502
+    assert result["latency_ms"] >= 0
 
 
 def test_edit_keeps_existing_upstream_key(tmp_path: Path, monkeypatch) -> None:
