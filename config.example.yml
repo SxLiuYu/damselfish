@@ -1,0 +1,118 @@
+server:
+  host: 127.0.0.1
+  port: 8086
+
+database: ./data/damselfish.db
+
+routing:
+  request_timeout_seconds: 120
+  connect_timeout_seconds: 10
+  probe_interval_seconds: 180
+  probe_stale_seconds: 120
+  ewma_alpha: 0.35
+  unknown_latency_ms: 1500
+  failure_penalty_ms: 2000
+  priority_weight_ms: 10
+  circuit_failures: 2
+  circuit_base_seconds: 30
+  circuit_max_seconds: 900
+  memory_max_messages: 40
+  memory_ttl_days: 30
+  project_memory_session_limit: 3
+  project_memory_message_limit: 6
+  project_memory_max_chars: 12000
+
+git_sync:
+  enabled: false
+  repository: ./data/memory-repo
+  remote_url_env: DAMSELFISH_MEMORY_GIT_URL
+  branch: main
+  pull_interval_seconds: 30
+  push_retries: 3
+  push_on_write: true
+  author_name: Damselfish Memory
+  author_email: damselfish@localhost
+  device_id_env: DAMSELFISH_DEVICE_ID
+
+scenarios:
+  default:
+    preferred: [chat, chinese, fast]
+  tool:
+    required: [tools]
+    preferred: [coding, reasoning]
+  coding:
+    required: [coding]
+    preferred: [tools, reasoning]
+  reasoning:
+    preferred: [reasoning]
+  creative:
+    preferred: [creative]
+  translation:
+    preferred: [multilingual, fast]
+  vision:
+    required: [vision]
+
+personas:
+  developer:
+    keywords: ["软件工程师", "开发者", "programmer", "developer"]
+    preferred: [coding, tools]
+  operator:
+    keywords: ["运维工程师", "devops", "sre"]
+    preferred: [coding, tools, reasoning]
+  writer:
+    keywords: ["作家", "文案", "writer"]
+    preferred: [creative, multilingual]
+
+targets:
+  - id: local-qwen3-8b
+    label: Local Qwen3 8B
+    base_url: http://127.0.0.1:8080/v1
+    model: Qwen3-8B-Q4_K_M.gguf
+    local: true
+    free: true
+    priority: 10
+    capabilities: [chat, chinese, coding, tools, fast]
+    scenarios: [default, coding, tool]
+    personas: [developer, operator]
+    probe: true
+    max_concurrency: 2
+
+  - id: agnes-2.5-flash
+    label: Agnes 2.5 Flash
+    base_url: https://apihub.agnes-ai.com/v1
+    model: agnes-2.5-flash
+    api_key_env: AGNES_API_KEY
+    free: true
+    priority: 20
+    capabilities: [chat, chinese, multilingual, tools, coding, reasoning, creative, fast]
+    probe: true
+
+  - id: agnes-2.0-flash
+    label: Agnes 2.0 Flash
+    base_url: https://apihub.agnes-ai.com/v1
+    model: agnes-2.0-flash
+    api_key_env: AGNES_API_KEY
+    free: true
+    priority: 30
+    capabilities: [chat, chinese, multilingual, tools, coding, reasoning, creative, fast]
+    probe: false
+
+  - id: glm-4.7-flash
+    label: GLM 4.7 Flash
+    base_url: https://open.bigmodel.cn/api/paas/v4
+    model: glm-4.7-flash
+    api_key_env: ZHIPU_API_KEY
+    free: true
+    priority: 40
+    capabilities: [chat, chinese, multilingual, tools, coding, reasoning, creative]
+    probe: true
+
+  - id: deepseek-v4-pro
+    label: DeepSeek V4 Pro
+    base_url: https://www.finna.com.cn/v1
+    model: deepseek-v4-pro
+    api_key_env: FINNA_API_KEY
+    free: true
+    priority: 50
+    capabilities: [chat, chinese, multilingual, tools, coding, reasoning]
+    probe: false

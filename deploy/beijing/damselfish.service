@@ -1,0 +1,28 @@
+[Unit]
+Description=Damselfish intelligent model router
+After=network-online.target llm-router.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=damselfish
+Group=damselfish
+WorkingDirectory=/opt/damselfish
+EnvironmentFile=/etc/damselfish.env
+ExecStart=/opt/damselfish/venv/bin/damselfish --config /opt/damselfish/config.yml
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadWritePaths=/var/lib/damselfish
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

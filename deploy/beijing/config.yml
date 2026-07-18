@@ -1,0 +1,79 @@
+server:
+  host: 127.0.0.1
+  port: 18086
+
+database: /var/lib/damselfish/damselfish.db
+
+routing:
+  request_timeout_seconds: 180
+  connect_timeout_seconds: 10
+  probe_interval_seconds: 180
+  probe_stale_seconds: 120
+  ewma_alpha: 0.35
+  unknown_latency_ms: 1500
+  failure_penalty_ms: 2000
+  priority_weight_ms: 10
+  circuit_failures: 2
+  circuit_base_seconds: 30
+  circuit_max_seconds: 900
+  memory_max_messages: 40
+  memory_ttl_days: 30
+  project_memory_session_limit: 3
+  project_memory_message_limit: 6
+  project_memory_max_chars: 12000
+
+git_sync:
+  enabled: true
+  repository: /var/lib/damselfish/memory-repo
+  remote_url_env: DAMSELFISH_MEMORY_GIT_URL
+  branch: main
+  pull_interval_seconds: 30
+  push_retries: 3
+  push_on_write: true
+  author_name: Damselfish Memory
+  author_email: damselfish@localhost
+  device_id_env: DAMSELFISH_DEVICE_ID
+
+scenarios:
+  default:
+    preferred: [chat, chinese, fast]
+  tool:
+    required: [tools]
+    preferred: [coding, reasoning]
+  coding:
+    required: [coding]
+    preferred: [tools, reasoning]
+  reasoning:
+    preferred: [reasoning]
+  creative:
+    preferred: [creative]
+  translation:
+    preferred: [multilingual, fast]
+  vision:
+    required: [vision]
+
+personas:
+  developer:
+    keywords: ["软件工程师", "开发者", "programmer", "developer"]
+    preferred: [coding, tools]
+  operator:
+    keywords: ["运维工程师", "devops", "sre"]
+    preferred: [coding, tools, reasoning]
+  writer:
+    keywords: ["作家", "文案", "writer"]
+    preferred: [creative, multilingual]
+
+targets:
+  - id: beijing-llm-router
+    label: Beijing LLM Router
+    base_url: http://127.0.0.1:8200/v1
+    model: auto
+    api_key_env: DAMSELFISH_UPSTREAM_API_KEY
+    local: true
+    free: true
+    priority: 10
+    capabilities: [chat, chinese, multilingual, tools, coding, reasoning, creative, fast, vision]
+    scenarios: [default, tool, coding, reasoning, creative, translation, vision]
+    personas: [developer, operator, writer]
+    probe: true
+    max_concurrency: 4

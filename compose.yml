@@ -1,0 +1,30 @@
+services:
+  damselfish:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8086:8086"
+    environment:
+      DAMSELFISH_CONFIG: /app/config.yml
+      DAMSELFISH_API_KEY: ${DAMSELFISH_API_KEY:-}
+      DAMSELFISH_MEMORY_GIT_URL: ${DAMSELFISH_MEMORY_GIT_URL:-}
+      DAMSELFISH_DEVICE_ID: ${DAMSELFISH_DEVICE_ID:-cloud}
+      AGNES_API_KEY: ${AGNES_API_KEY:-}
+      ZHIPU_API_KEY: ${ZHIPU_API_KEY:-}
+      FINNA_API_KEY: ${FINNA_API_KEY:-}
+    volumes:
+      - ./config.yml:/app/config.yml:ro
+      - damselfish-data:/app/data
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8086/health', timeout=5)"
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  damselfish-data:
