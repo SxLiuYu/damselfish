@@ -342,3 +342,140 @@ def test_stream_call_timeout_504_before_first_chunk(tmp_path: Path) -> None:
 
     asyncio.run(run())
     store.close()
+
+
+def test_stream_complete_phase1_success(tmp_path: Path) -> None:
+    """stream_complete yields chunks from primary target on success."""
+    config = AppConfig(
+        host="127.0.0.1", port=8086, database=tmp_path / "test.db",
+        routing=RoutingConfig(),
+        targets=(TargetConfig("test", "Test", "http://router/v1", "test-model", local=True),),
+    )
+    store = Store(config.database, ["test"])
+    sse_bytes = (
+        'data: {"id":"x","choices":[{"delta":{"role":"assistant"},"finish_reason":null}]}\n\n'
+        'data: {"id":"x","choices":[{"delta":{"content":"hi"},"finish_reason":null}]}\n\n'
+        'data: {"id":"x","choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+        'data: [DONE]\n\n'
+    ).encode()
+
+    def handler(request):
+        return httpx.Response(200, content=sse_bytes)
+
+    async def run():
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        router = ModelRouter(config, store, client)
+        payload = {"messages": [{"role": "user", "content": "hi"}]}
+        chunks = []
+        async for chunk in router.stream_complete(
+            payload,
+            RouteContext("default", None, frozenset(), frozenset(), ()),
+            "test",
+        ):
+            chunks.append(chunk)
+        assert len(chunks) == 3
+        assert chunks[0]["choices"][0]["delta"]["role"] == "assistant"
+        assert router._stream_result is not None
+        assert router._stream_result.target.id == "test"
+
+    asyncio.run(run())
+    store.close()
+
+
+def test_stream_complete_phase1_429_fallback(tmp_path: Path) -> None:
+    """Phase 1 returns 429, Phase 2 race yields chunks from winner."""
+    config = AppConfig(
+        host="127.0.0.1", port=8086, database=tmp_path / "test.db",
+        routing=RoutingConfig(
+            priority_weight_ms=1,
+            parallel_fallback_count=2,
+            parallel_fallback_timeout_seconds=5.0,
+        ),
+        targets=(
+            TargetConfig("primary", "Primary", "http://router/v1", "primary", local=True, priority=1),
+            TargetConfig("alt", "Alt", "http://router/v1", "alt", local=True, priority=2),
+            TargetConfig("backup", "Backup", "http://router/v1", "backup", local=True, priority=3),
+        ),
+    )
+    store = Store(config.database, ["primary", "alt", "backup"])
+    sse_bytes = (
+        'data: {"id":"x","choices":[{"delta":{"content":"from alt"},"finish_reason":null}]}\n\n'
+        'data: {"id":"x","choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+        'data: [DONE]\n\n'
+    ).encode()
+
+    def handler(request):
+        model = __import__("json").loads(request.content)["model"]
+        if model == "primary":
+            return httpx.Response(429, json={"error": {"message": "limited"}})
+        return httpx.Response(200, content=sse_bytes)
+
+    async def run():
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        router = ModelRouter(config, store, client)
+        payload = {"messages": [{"role": "user", "content": "hi"}]}
+        chunks = []
+        async for chunk in router.stream_complete(
+            payload,
+            RouteContext("default", None, frozenset(), frozenset(), ()),
+            "test",
+        ):
+            chunks.append(chunk)
+        assert len(chunks) >= 1
+        assert router._stream_result is not None
+        assert router._stream_result.target.id in {"alt", "backup"}
+
+    asyncio.run(run())
+    store.close()
+
+
+def test_stream_complete_phase2_all_fail_falls_to_serial(tmp_path: Path) -> None:
+    """Phase 1 429, Phase 2 all fail, Phase 3 serial fallback succeeds."""
+    config = AppConfig(
+        host="127.0.0.1", port=8086, database=tmp_path / "test.db",
+        routing=RoutingConfig(
+            priority_weight_ms=1,
+            parallel_fallback_count=2,
+            parallel_fallback_timeout_seconds=5.0,
+        ),
+        targets=(
+            TargetConfig("primary", "Primary", "http://router/v1", "primary", local=True, priority=1),
+            TargetConfig("fail1", "Fail1", "http://router/v1", "fail1", local=True, priority=2),
+            TargetConfig("fail2", "Fail2", "http://router/v1", "fail2", local=True, priority=3),
+            TargetConfig("winner", "Winner", "http://router/v1", "winner", local=True, priority=4),
+        ),
+    )
+    store = Store(config.database, ["primary", "fail1", "fail2", "winner"])
+
+    def handler(request):
+        model = __import__("json").loads(request.content)["model"]
+        if model in ("primary", "fail1", "fail2"):
+            return httpx.Response(429, json={"error": {"message": "limited"}})
+        return httpx.Response(
+            200,
+            json={
+                "id": "ok",
+                "choices": [{
+                    "message": {"role": "assistant", "content": "from winner"},
+                    "finish_reason": "stop",
+                }],
+            },
+        )
+
+    async def run():
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        router = ModelRouter(config, store, client)
+        payload = {"messages": [{"role": "user", "content": "hi"}]}
+        chunks = []
+        async for chunk in router.stream_complete(
+            payload,
+            RouteContext("default", None, frozenset(), frozenset(), ()),
+            "test",
+        ):
+            chunks.append(chunk)
+        assert len(chunks) >= 1
+        assert router._stream_result is not None
+        assert router._stream_result.target.id == "winner"
+
+    asyncio.run(run())
+    store.close()

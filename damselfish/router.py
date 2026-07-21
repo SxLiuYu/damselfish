@@ -113,6 +113,80 @@ class ModelRouter:
         )
         return result
 
+    async def stream_complete(
+        self,
+        payload: dict[str, Any],
+        context: RouteContext,
+        session_id: str | None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Streaming version of ``complete()``.
+
+        Yields normalized SSE chunks.  On 429/504 before the first chunk,
+        falls through to parallel race.  After the stream ends, the caller
+        can read ``self._stream_result`` for the final ``CompletionResult``.
+        """
+        targets = rank_targets(
+            self.config,
+            context,
+            self.store.all_stats(),
+            str(payload.get("model", "auto")),
+        )
+        if not targets:
+            raise NoTargetAvailable(
+                f"no healthy target has required capabilities: {sorted(context.required)}"
+            )
+
+        self._stream_result: CompletionResult | None = None
+        primary = targets[0]
+        iterator = self._stream_call(primary, payload)
+        try:
+            first_chunk = await iterator.__anext__()
+        except StopAsyncIteration:
+            raise NoTargetAvailable(f"primary target {primary.id} returned empty stream")
+        except UpstreamFailure as error:
+            self.store.record_decision(
+                session_id, context.scenario, context.persona, primary.id,
+                None, False, error.status, str(error),
+            )
+            if error.status not in (429, 504) or len(targets) < 2:
+                raise NoTargetAvailable(
+                    f"primary target {primary.id} failed: HTTP {error.status} {error}"
+                ) from error
+            # Phase 2: parallel race
+            result = await self._race_stream(
+                targets[1:], payload, context, session_id,
+            )
+            if result is None:
+                # Phase 3: serial fallback on leftovers
+                suffix = [t for t in targets[1:] if t.id not in self._raced_ids]
+                result = await self._serial_fallback(suffix, payload, context, session_id)
+            self._stream_result = result
+            self.store.record_decision(
+                session_id, context.scenario, context.persona, result.target.id,
+                result.latency_ms, True,
+            )
+            log.info(
+                "route scenario=%s persona=%s target=%s latency_ms=%.1f (stream fallback)",
+                context.scenario, context.persona or "-", result.target.id, result.latency_ms,
+            )
+            # Non-streaming fallback result → single SSE chunk
+            yield _normalize_stream_chunk(result.body, result.target.model)
+            return
+
+        # Phase 1 succeeded: yield first chunk, then continue streaming
+        yield first_chunk
+        async for chunk in iterator:
+            yield chunk
+        self._stream_result = CompletionResult(body={}, target=primary, latency_ms=0)
+        self.store.record_decision(
+            session_id, context.scenario, context.persona, primary.id,
+            self._stream_result.latency_ms, True,
+        )
+        log.info(
+            "route scenario=%s persona=%s target=%s latency_ms=%.1f (stream)",
+            context.scenario, context.persona or "-", primary.id, self._stream_result.latency_ms,
+        )
+
     async def _race_targets(
         self,
         candidates: list[TargetConfig],
@@ -186,6 +260,90 @@ class ModelRouter:
             return None
         finally:
             for task in tasks:
+                if not task.done():
+                    task.cancel()
+
+    async def _race_stream(
+        self,
+        candidates: list[TargetConfig],
+        payload: dict[str, Any],
+        context: RouteContext,
+        session_id: str | None,
+    ) -> CompletionResult | None:
+        """Race up to ``parallel_fallback_count`` streaming candidates.
+
+        Returns the first candidate's ``CompletionResult`` and sets
+        ``self._stream_result`` to the winner.  Returns ``None`` if every
+        parallel attempt fails or times out.
+        """
+        limit = max(1, self.config.routing.parallel_fallback_count)
+        racing = candidates[:limit]
+        if not racing:
+            return None
+        self._raced_ids = {target.id for target in racing}
+        timeout = self.config.routing.parallel_fallback_timeout_seconds
+
+        first_chunk_tasks: dict[asyncio.Task, TargetConfig] = {}
+        iterators: dict[TargetConfig, AsyncIterator[dict]] = {}
+        for target in racing:
+            iterator = self._stream_call(target, payload)
+            iterators[target] = iterator
+            task = asyncio.create_task(iterator.__anext__())
+            first_chunk_tasks[task] = target
+
+        pending = set(first_chunk_tasks)
+        failures: list[str] = []
+        winner_target: TargetConfig | None = None
+        try:
+            while pending and winner_target is None:
+                done, pending = await asyncio.wait(
+                    pending, timeout=timeout, return_when=asyncio.FIRST_COMPLETED,
+                )
+                if not done:
+                    log.warning(
+                        "parallel stream race timed out after %.1fs; tried %s",
+                        timeout, ", ".join(t.id for t in racing),
+                    )
+                    break
+                for task in done:
+                    target = first_chunk_tasks[task]
+                    try:
+                        task.result()  # first chunk already consumed
+                    except UpstreamFailure as error:
+                        failures.append(f"{target.id}: HTTP {error.status} {error}")
+                        self.store.record_decision(
+                            session_id, context.scenario, context.persona,
+                            target.id, None, False, error.status, str(error),
+                        )
+                        continue
+                    except StopAsyncIteration:
+                        failures.append(f"{target.id}: empty stream")
+                        continue
+                    except Exception as error:
+                        failures.append(f"{target.id}: {error}")
+                        continue
+                    # Winner!
+                    winner_target = target
+                    break
+            if winner_target is None:
+                log.warning(
+                    "all parallel stream candidates failed: %s",
+                    "; ".join(failures),
+                )
+                return None
+            # Cancel remaining tasks and close losing iterators
+            for task in pending:
+                task.cancel()
+            for t, it in iterators.items():
+                if t is not winner_target:
+                    await it.aclose()
+            return CompletionResult(
+                body={"choices": [{"message": {"content": ""}}]},
+                target=winner_target,
+                latency_ms=0,
+            )
+        finally:
+            for task in first_chunk_tasks:
                 if not task.done():
                     task.cancel()
 
