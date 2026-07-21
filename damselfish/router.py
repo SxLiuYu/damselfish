@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -44,6 +45,7 @@ class ModelRouter:
             target.id: asyncio.Semaphore(target.max_concurrency)
             for target in config.targets
         }
+        self._raced_ids: set[str] = set()
 
     def reconfigure(self, config: AppConfig) -> None:
         self.config = config
@@ -71,8 +73,130 @@ class ModelRouter:
                 f"no healthy target has required capabilities: {sorted(context.required)}"
             )
 
+        # Phase 1: serial attempt on the best target. On 429/504 (rate limit /
+        # timeout) we fall through to Phase 2 and race the remaining candidates
+        # in parallel, returning the first successful response. If every parallel
+        # candidate fails we fall back to serial retry on the leftover targets.
+        primary = targets[0]
+        try:
+            result = await self._call(primary, payload)
+        except UpstreamFailure as error:
+            self.store.record_decision(
+                session_id, context.scenario, context.persona, primary.id,
+                None, False, error.status, str(error),
+            )
+            if error.status not in (429, 504) or len(targets) < 2:
+                raise NoTargetAvailable(
+                    f"primary target {primary.id} failed: HTTP {error.status} {error}"
+                ) from error
+            result = await self._race_targets(
+                targets[1:], payload, context, session_id,
+            )
+            if result is None:
+                # All parallel candidates failed; try the rest serially.
+                suffix = [
+                    t for t in targets[1:]
+                    if t.id not in self._raced_ids
+                ]
+                result = await self._serial_fallback(
+                    suffix, payload, context, session_id,
+                )
+        self.store.record_decision(
+            session_id, context.scenario, context.persona, result.target.id,
+            result.latency_ms, True,
+        )
+        log.info(
+            "route scenario=%s persona=%s target=%s latency_ms=%.1f",
+            context.scenario, context.persona or "-", result.target.id, result.latency_ms,
+        )
+        return result
+
+    async def _race_targets(
+        self,
+        candidates: list[TargetConfig],
+        payload: dict[str, Any],
+        context: RouteContext,
+        session_id: str | None,
+    ) -> CompletionResult | None:
+        """Race up to ``parallel_fallback_count`` candidates in parallel.
+
+        Returns the first successful ``CompletionResult`` and cancels the rest.
+        Records a decision row for every attempted target and tracks the ids in
+        ``self._raced_ids`` so the caller can serially retry the leftovers.
+        Returns ``None`` if every parallel attempt fails or the race times out.
+        """
+        limit = max(1, self.config.routing.parallel_fallback_count)
+        racing = candidates[:limit]
+        if not racing:
+            return None
+        self._raced_ids = {target.id for target in racing}
+        timeout = self.config.routing.parallel_fallback_timeout_seconds
+
+        tasks: dict[asyncio.Task[CompletionResult], TargetConfig] = {}
+        for target in racing:
+            tasks[asyncio.create_task(self._call(target, payload))] = target
+
+        pending = set(tasks)
+        last_failure: UpstreamFailure | None = None
         failures: list[str] = []
-        for target in targets:
+        try:
+            while pending:
+                done, pending = await asyncio.wait(
+                    pending, timeout=timeout, return_when=asyncio.FIRST_COMPLETED,
+                )
+                if not done:
+                    # Timed out waiting for any winner; cancel the rest and
+                    # fall back to serial handling of the remaining candidates.
+                    log.warning(
+                        "parallel fallback timed out after %.1fs; tried %s",
+                        timeout, ", ".join(t.id for t in racing),
+                    )
+                    return None
+                for task in done:
+                    target = tasks[task]
+                    try:
+                        result = task.result()
+                    except UpstreamFailure as error:
+                        last_failure = error
+                        failures.append(
+                            f"{target.id}: HTTP {error.status} {error}"
+                        )
+                        self.store.record_decision(
+                            session_id, context.scenario, context.persona,
+                            target.id, None, False, error.status, str(error),
+                        )
+                        continue
+                    except Exception as error:  # pragma: no cover - defensive
+                        failures.append(f"{target.id}: {error}")
+                        self.store.record_decision(
+                            session_id, context.scenario, context.persona,
+                            target.id, None, False, 502, str(error),
+                        )
+                        continue
+                    # Winner: cancel the remaining tasks and return.
+                    for leftover in pending:
+                        leftover.cancel()
+                    return result
+            log.warning(
+                "all parallel fallback targets failed: %s",
+                "; ".join(failures),
+            )
+            return None
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+
+    async def _serial_fallback(
+        self,
+        candidates: list[TargetConfig],
+        payload: dict[str, Any],
+        context: RouteContext,
+        session_id: str | None,
+    ) -> CompletionResult:
+        """Serially try leftover candidates after a parallel race failure."""
+        failures: list[str] = []
+        for target in candidates:
             try:
                 result = await self._call(target, payload)
             except UpstreamFailure as error:
@@ -82,16 +206,10 @@ class ModelRouter:
                     None, False, error.status, str(error),
                 )
                 continue
-            self.store.record_decision(
-                session_id, context.scenario, context.persona, target.id,
-                result.latency_ms, True,
-            )
-            log.info(
-                "route scenario=%s persona=%s target=%s latency_ms=%.1f",
-                context.scenario, context.persona or "-", target.id, result.latency_ms,
-            )
             return result
-        raise NoTargetAvailable("all matching targets failed: " + "; ".join(failures))
+        raise NoTargetAvailable(
+            "all matching targets failed: " + "; ".join(failures)
+        )
 
     async def _call(
         self, target: TargetConfig, payload: dict[str, Any], probe: bool = False

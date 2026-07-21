@@ -79,7 +79,8 @@ class RoutingConfig:
     project_memory_max_chars: int = 12000
     memory_compression_threshold: int = 30
     memory_compression_keep: int = 10
-
+    parallel_fallback_count: int = 3
+    parallel_fallback_timeout_seconds: float = 30.0
 
 
 @dataclass(frozen=True, slots=True)
