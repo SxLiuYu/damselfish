@@ -79,3 +79,69 @@ def test_project_memory_api_and_context_injection(
     assert len(sessions) == 2
     assert deployment["messages"][0]["content"] == "Deploy it"
     assert all(message["role"] != "system" for message in deployment["messages"])
+
+
+def test_streaming_chat_completion(tmp_path: Path, monkeypatch) -> None:
+    """Streaming request returns SSE chunks and saves memory."""
+    target = TargetConfig(
+        "local", "Local", "http://unused/v1", "local-model", local=True, probe=False
+    )
+    config = AppConfig(
+        host="127.0.0.1",
+        port=18086,
+        database=tmp_path / "app.db",
+        routing=RoutingConfig(),
+        targets=(target,),
+    )
+
+    async def stream_complete(self, payload, context, session_id):
+        # Simulate streaming chunks
+        from damselfish.router import CompletionResult
+        chunks = [
+            {"id": "x", "object": "chat.completion.chunk", "created": 1,
+             "model": "local-model",
+             "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]},
+            {"id": "x", "object": "chat.completion.chunk", "created": 1,
+             "model": "local-model",
+             "choices": [{"index": 0, "delta": {"content": "hello"}, "finish_reason": None}]},
+            {"id": "x", "object": "chat.completion.chunk", "created": 1,
+             "model": "local-model",
+             "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+        ]
+        for chunk in chunks:
+            yield chunk
+        self._stream_result = CompletionResult(
+            body={"choices": [{"message": {"content": "hello"}}]},
+            target=target, latency_ms=1.0,
+        )
+
+    monkeypatch.setattr(ModelRouter, "stream_complete", stream_complete)
+
+    app = create_app(config)
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "damselfish/auto",
+                "stream": True,
+                "damselfish": {
+                    "project_id": "stream-test",
+                    "session_id": "sess1",
+                },
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/event-stream")
+        body = response.text
+        assert "data: " in body
+        assert "[DONE]" in body
+        assert "hello" in body
+        # Verify memory was saved
+        session = client.get(
+            "/v1/memory/projects/stream-test/sessions/sess1"
+        ).json()
+        assert any(
+            m.get("content") == "hello" for m in session["messages"]
+            if m.get("role") == "assistant"
+        )

@@ -29,7 +29,7 @@ from .nodes import (
     test_node,
 )
 from .router import ModelRouter, NoTargetAvailable
-from .selector import infer_context
+from .selector import infer_context, RouteContext
 from .store import Store, merge_messages, project_context_message
 
 log = logging.getLogger("damselfish")
@@ -330,6 +330,12 @@ def create_app(config: AppConfig | None = None, config_path: str | Path | None =
         wants_stream = bool(payload.get("stream"))
         try:
             decision_session = f"{project_id}/{session_id}" if session_id else None
+            if wants_stream:
+                return await _handle_streaming(
+                    request, payload, context, decision_session,
+                    memory_enabled, transcript, project_id, project_title,
+                    session_title, session_id,
+                )
             result = await request.app.state.router.complete(
                 payload, context, decision_session
             )
@@ -368,10 +374,6 @@ def create_app(config: AppConfig | None = None, config_path: str | Path | None =
         }
         if session_id:
             headers["X-Damselfish-Session"] = session_id
-        if wants_stream:
-            return StreamingResponse(
-                _as_sse(result.body), media_type="text/event-stream", headers=headers
-            )
         return JSONResponse(content=result.body, headers=headers)
 
     @app.get("/v1/memory/projects")
@@ -475,6 +477,89 @@ async def _as_sse(body: dict[str, Any]) -> AsyncIterator[str]:
 
 def build_default_app() -> FastAPI:
     return create_app()
+
+
+async def _handle_streaming(
+    request: Request,
+    payload: dict[str, Any],
+    context: RouteContext,
+    decision_session: str | None,
+    memory_enabled: bool,
+    transcript: list[dict[str, Any]],
+    project_id: str,
+    project_title: str | None,
+    session_title: str | None,
+    session_id: str | None,
+) -> StreamingResponse:
+    """Handle a streaming chat completion request.
+
+    Calls ``router.stream_complete()`` and forwards normalized SSE chunks
+    to the client.  Accumulates content and saves memory after the stream
+    ends.
+    """
+    router = request.app.state.router
+    loaded = request.app.state.config
+    accumulated_content: list[str] = []
+    first_chunk_time: list[float] = []
+
+    async def stream_chunks() -> AsyncIterator[str]:
+        target_id = ""
+        target_model = ""
+        try:
+            async for chunk in router.stream_complete(payload, context, decision_session):
+                # Track latency from first chunk
+                if not first_chunk_time:
+                    first_chunk_time.append(time.monotonic())
+                # Accumulate content for memory
+                choices = chunk.get("choices", [])
+                if choices:
+                    delta = choices[0].get("delta", {})
+                    if isinstance(delta, dict) and delta.get("content"):
+                        accumulated_content.append(delta["content"])
+                if chunk.get("model"):
+                    target_model = chunk["model"]
+                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+        except NoTargetAvailable as error:
+            error_chunk = {
+                "error": {"message": str(error), "type": "router_unavailable"}
+            }
+            yield f"data: {json.dumps(error_chunk, ensure_ascii=False)}\n\n"
+            return
+        yield "data: [DONE]\n\n"
+        # Save memory after stream ends
+        result = getattr(router, "_stream_result", None)
+        if result is not None:
+            target_id = result.target.id
+            target_model = result.target.model
+        if memory_enabled and session_id and accumulated_content:
+            assistant = {"role": "assistant", "content": "".join(accumulated_content)}
+            request.app.state.store.save_session(
+                session_id,
+                transcript + [assistant],
+                loaded.routing.memory_max_messages,
+                project_id=project_id,
+                project_title=project_title,
+                session_title=session_title,
+                source_device=request.app.state.memory_sync.device_id,
+            )
+            await request.app.state.memory_sync.sync_pending()
+            if len(transcript) + 1 > loaded.routing.memory_compression_threshold:
+                asyncio.create_task(_compress_conversation(
+                    request.app.state.store, request.app.state.router,
+                    session_id, transcript + [assistant],
+                    loaded.routing.memory_compression_keep,
+                ))
+
+    headers = {
+        "X-Damselfish-Scenario": context.scenario,
+        "X-Damselfish-Project": project_id,
+        "X-Damselfish-Memory-Sync": request.app.state.memory_sync.response_status(),
+    }
+    if session_id:
+        headers["X-Damselfish-Session"] = session_id
+    return StreamingResponse(
+        stream_chunks(), media_type="text/event-stream", headers=headers
+    )
 
 
 def _identifier(value: Any, name: str, optional: bool = False) -> str | None:
