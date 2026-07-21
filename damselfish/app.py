@@ -351,6 +351,13 @@ def create_app(config: AppConfig | None = None, config_path: str | Path | None =
                 source_device=request.app.state.memory_sync.device_id,
             )
             await request.app.state.memory_sync.sync_pending()
+            # Background compression for long conversations
+            if len(transcript) + 1 > loaded.routing.memory_compression_threshold:
+                asyncio.create_task(_compress_conversation(
+                    request.app.state.store, request.app.state.router,
+                    session_id, transcript + [assistant],
+                    loaded.routing.memory_compression_keep,
+                ))
         headers = {
             "X-Damselfish-Target": result.target.id,
             "X-Damselfish-Model": result.target.model,
@@ -401,6 +408,49 @@ def create_app(config: AppConfig | None = None, config_path: str | Path | None =
 
     return app
 
+
+
+
+async def _compress_conversation(store, router, session_id, messages, keep):
+    """Compress old conversation messages using a lightweight model."""
+    if not session_id or len(messages) <= keep + 5:
+        return
+    try:
+        old = messages[:-keep]
+        recent = messages[-keep:]
+        text = "\n".join(
+            str(m.get("content", ""))
+            for m in old if isinstance(m.get("content"), str) and m.get("content")
+        )
+        if not text.strip():
+            return
+        prompt = (
+            "Please summarize the following conversation briefly in Chinese. "
+            "Cover user needs, resolved issues, and key decisions. "
+            "Keep enough detail for continuity. Max 200 chars.\n\n" + text
+        )
+        from .selector import RouteContext
+        ctx = RouteContext(
+            scenario="default", persona=None,
+            required=frozenset(), preferred=frozenset({"fast"}),
+            preferred_targets=("deepseek-v4-flash",),
+        )
+        payload = {
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 400, "temperature": 0.5,
+        }
+        result = await router.complete(payload, ctx, None)
+        summary = result.body["choices"][0]["message"].get("content", "")
+        if not summary:
+            return
+        compressed = [
+            {"role": "system", "content": "Conversation summary: " + summary}
+        ] + recent
+        store.update_session_messages(session_id, compressed)
+        log.info("compressed session %s: %d -> %d messages",
+                 session_id[:8], len(messages), len(compressed))
+    except Exception as e:
+        log.warning("compression failed for %s: %s", session_id[:8], e)
 
 async def _as_sse(body: dict[str, Any]) -> AsyncIterator[str]:
     choice = body["choices"][0]

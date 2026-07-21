@@ -335,6 +335,22 @@ class Store:
                 )
         return event
 
+
+    def update_session_messages(
+        self, session_id: str, messages: list[dict[str, Any]],
+    ) -> None:
+        with self._lock:
+            serialized = json.dumps(messages, ensure_ascii=False)
+            self._connection.execute(
+                "UPDATE sessions SET messages_json = ?, updated_at = ? WHERE session_id = ?",
+                (serialized, time.time(), session_id),
+            )
+            self._connection.execute(
+                "UPDATE project_sessions SET messages_json = ?, updated_at = ?"
+                " WHERE session_id = ?",
+                (serialized, time.time(), session_id),
+            )
+
     def list_projects(self) -> list[dict[str, Any]]:
         with self._lock:
             rows = self._connection.execute(

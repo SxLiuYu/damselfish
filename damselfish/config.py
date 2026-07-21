@@ -69,14 +69,17 @@ class RoutingConfig:
     unknown_latency_ms: float = 1500.0
     failure_penalty_ms: float = 2000.0
     priority_weight_ms: float = 10.0
-    circuit_failures: int = 2
-    circuit_base_seconds: float = 30.0
-    circuit_max_seconds: float = 900.0
+    circuit_failures: int = 3
+    circuit_base_seconds: float = 15.0
+    circuit_max_seconds: float = 300.0
     memory_max_messages: int = 40
     memory_ttl_days: int = 30
     project_memory_session_limit: int = 3
     project_memory_message_limit: int = 6
     project_memory_max_chars: int = 12000
+    memory_compression_threshold: int = 30
+    memory_compression_keep: int = 10
+
 
 
 @dataclass(frozen=True, slots=True)

@@ -149,6 +149,9 @@ class ModelRouter:
             )
         else:
             delay = 0
+        if delay > 0:
+            jitter = random.uniform(0, delay * 0.2)
+            delay = min(delay + jitter, self.config.routing.circuit_max_seconds)
         self.store.record_failure(
             target.id, status, message, time.time() + delay, probe
         )
