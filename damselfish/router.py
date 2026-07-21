@@ -437,6 +437,19 @@ class ModelRouter:
                     target, response.status_code, _error_message(response)
                 )
             latency_ms = (time.monotonic() - started) * 1000
+            content_type = response.headers.get("content-type", "").lower()
+            json_response = "application/json" in content_type or response.content.lstrip().startswith(b"{")
+            if "text/event-stream" not in content_type and json_response:
+                body = response.json()
+                if not isinstance(body, dict) or not isinstance(body.get("choices"), list):
+                    raise ValueError("non-streaming upstream response has no choices")
+                normalized = _normalize_stream_chunk(body, target.model)
+                self.store.record_success(
+                    target.id, latency_ms, self.config.routing.ewma_alpha, probe
+                )
+                _first_yielded = True
+                yield normalized
+                return
             async for line in response.aiter_lines():
                 line = line.strip()
                 if not line.startswith("data: "):

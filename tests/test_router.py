@@ -294,6 +294,44 @@ def test_stream_call_yields_chunks(tmp_path: Path) -> None:
     store.close()
 
 
+def test_stream_call_converts_non_streaming_json_response(tmp_path: Path) -> None:
+    config = AppConfig(
+        host="127.0.0.1", port=8086, database=tmp_path / "test.db",
+        routing=RoutingConfig(),
+        targets=(TargetConfig("test", "Test", "http://router/v1", "test-model", local=True),),
+    )
+    store = Store(config.database, ["test"])
+
+    def handler(request):
+        return httpx.Response(200, json={
+            "id": "completion",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "upstream-model",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "OK"},
+                "finish_reason": "stop",
+            }],
+        })
+
+    async def run():
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        router = ModelRouter(config, store, client)
+        chunks = []
+        async for chunk in router._stream_call(
+            config.targets[0], {"messages": [{"role": "user", "content": "hi"}]}
+        ):
+            chunks.append(chunk)
+        await client.aclose()
+        assert len(chunks) == 1
+        assert chunks[0]["choices"][0]["delta"]["content"] == "OK"
+        assert chunks[0]["choices"][0]["finish_reason"] == "stop"
+
+    asyncio.run(run())
+    store.close()
+
+
 def test_stream_call_429_raises_before_first_chunk(tmp_path: Path) -> None:
     """_stream_call raises UpstreamFailure before yielding if status is 429."""
     config = AppConfig(

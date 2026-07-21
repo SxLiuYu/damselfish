@@ -5,7 +5,7 @@ import sqlite3
 import threading
 import time
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +30,15 @@ class TargetStats:
         data = asdict(self)
         data["circuit_open"] = self.circuit_open_until > time.time()
         return data
+
+
+_TARGET_STATS_FIELDS = frozenset(field.name for field in fields(TargetStats))
+
+
+def _target_stats_from_row(row: sqlite3.Row) -> TargetStats:
+    return TargetStats(
+        **{key: value for key, value in dict(row).items() if key in _TARGET_STATS_FIELDS}
+    )
 
 
 class Store:
@@ -125,7 +134,7 @@ class Store:
             ).fetchone()
         if row is None:
             raise KeyError(target_id)
-        return TargetStats(**dict(row))
+        return _target_stats_from_row(row)
 
     def ensure_targets(self, target_ids: list[str]) -> None:
         with self._lock, self._connection:
@@ -137,7 +146,7 @@ class Store:
     def all_stats(self) -> dict[str, TargetStats]:
         with self._lock:
             rows = self._connection.execute("SELECT * FROM target_stats").fetchall()
-        return {row["target_id"]: TargetStats(**dict(row)) for row in rows}
+        return {row["target_id"]: _target_stats_from_row(row) for row in rows}
 
     def record_success(
         self, target_id: str, latency_ms: float, alpha: float, probe: bool = False

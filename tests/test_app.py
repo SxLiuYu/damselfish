@@ -1,11 +1,15 @@
+import asyncio
+import sqlite3
 from pathlib import Path
 from typing import Any
 
+import httpx
 from fastapi.testclient import TestClient
 
 from damselfish.app import create_app
 from damselfish.config import AppConfig, RoutingConfig, TargetConfig
 from damselfish.router import CompletionResult, ModelRouter
+from damselfish.store import Store
 
 
 def test_project_memory_api_and_context_injection(
@@ -145,3 +149,61 @@ def test_streaming_chat_completion(tmp_path: Path, monkeypatch) -> None:
             m.get("content") == "hello" for m in session["messages"]
             if m.get("role") == "assistant"
         )
+
+
+def test_streaming_chat_completion_with_historical_stats_columns(
+    tmp_path: Path,
+) -> None:
+    target = TargetConfig(
+        "local", "Local", "http://unused/v1", "local-model", local=True, probe=False
+    )
+    config = AppConfig(
+        host="127.0.0.1",
+        port=18086,
+        database=tmp_path / "app.db",
+        routing=RoutingConfig(),
+        targets=(target,),
+    )
+    store = Store(config.database, [target.id])
+    store.close()
+    with sqlite3.connect(config.database) as connection:
+        connection.execute(
+            "ALTER TABLE target_stats ADD COLUMN prompt_tokens INTEGER NOT NULL DEFAULT 0"
+        )
+        connection.execute(
+            "ALTER TABLE target_stats ADD COLUMN completion_tokens INTEGER NOT NULL DEFAULT 0"
+        )
+        connection.execute(
+            "ALTER TABLE target_stats ADD COLUMN total_tokens INTEGER NOT NULL DEFAULT 0"
+        )
+
+    upstream_body = (
+        'data: {"id":"x","choices":[{"delta":{"role":"assistant"},'
+        '"finish_reason":null}]}\n\n'
+        'data: {"id":"x","choices":[{"delta":{"content":"OK"},'
+        '"finish_reason":null}]}\n\n'
+        'data: {"id":"x","choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+        "data: [DONE]\n\n"
+    ).encode()
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=upstream_body)
+
+    app = create_app(config)
+    upstream_client = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
+    with TestClient(app) as client:
+        app.state.router.client = upstream_client
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "damselfish/auto",
+                "stream": True,
+                "messages": [{"role": "user", "content": "Reply with OK"}],
+            },
+        )
+
+    asyncio.run(upstream_client.aclose())
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert '"finish_reason": "stop"' in response.text
+    assert "data: [DONE]" in response.text
