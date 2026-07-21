@@ -2,9 +2,10 @@ import asyncio
 from pathlib import Path
 
 import httpx
+import pytest
 
 from damselfish.config import AppConfig, RoutingConfig, TargetConfig
-from damselfish.router import ModelRouter
+from damselfish.router import ModelRouter, UpstreamFailure
 from damselfish.selector import RouteContext
 from damselfish.store import Store
 
@@ -251,4 +252,93 @@ def test_parallel_fallback_all_fail_falls_to_serial(tmp_path: Path) -> None:
     assert "fail1" in call_order
     assert "fail2" in call_order
     assert "winner" in call_order
+    store.close()
+
+
+# ─── Streaming tests ─────────────────────────────────────────────────
+
+
+def test_stream_call_yields_chunks(tmp_path: Path) -> None:
+    """_stream_call yields normalized SSE chunks from upstream."""
+    config = AppConfig(
+        host="127.0.0.1", port=8086, database=tmp_path / "test.db",
+        routing=RoutingConfig(),
+        targets=(TargetConfig("test", "Test", "http://router/v1", "test-model", local=True),),
+    )
+    store = Store(config.database, ["test"])
+    sse_chunks = [
+        'data: {"id":"x","choices":[{"delta":{"role":"assistant"},"finish_reason":null}]}\n\n',
+        'data: {"id":"x","choices":[{"delta":{"content":"hello"},"finish_reason":null}]}\n\n',
+        'data: {"id":"x","choices":[{"delta":{},"finish_reason":"stop"}]}\n\n',
+        "data: [DONE]\n\n",
+    ]
+    sse_bytes = "".join(sse_chunks).encode()
+
+    def handler(request):
+        return httpx.Response(200, content=sse_bytes)
+
+    async def run():
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        router = ModelRouter(config, store, client)
+        payload = {"messages": [{"role": "user", "content": "hi"}]}
+        chunks = []
+        async for chunk in router._stream_call(config.targets[0], payload):
+            chunks.append(chunk)
+        assert len(chunks) == 3
+        assert chunks[0]["choices"][0]["delta"]["role"] == "assistant"
+        assert chunks[1]["choices"][0]["delta"]["content"] == "hello"
+        assert chunks[2]["choices"][0]["finish_reason"] == "stop"
+        assert chunks[0]["model"] == "test-model"
+
+    asyncio.run(run())
+    store.close()
+
+
+def test_stream_call_429_raises_before_first_chunk(tmp_path: Path) -> None:
+    """_stream_call raises UpstreamFailure before yielding if status is 429."""
+    config = AppConfig(
+        host="127.0.0.1", port=8086, database=tmp_path / "test.db",
+        routing=RoutingConfig(),
+        targets=(TargetConfig("test", "Test", "http://router/v1", "test-model", local=True),),
+    )
+    store = Store(config.database, ["test"])
+
+    def handler(request):
+        return httpx.Response(429, json={"error": {"message": "limited"}})
+
+    async def run():
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        router = ModelRouter(config, store, client)
+        payload = {"messages": [{"role": "user", "content": "hi"}]}
+        with pytest.raises(UpstreamFailure) as exc:
+            async for _ in router._stream_call(config.targets[0], payload):
+                pass
+        assert exc.value.status == 429
+
+    asyncio.run(run())
+    store.close()
+
+
+def test_stream_call_timeout_504_before_first_chunk(tmp_path: Path) -> None:
+    """_stream_call raises UpstreamFailure(504) on timeout."""
+    config = AppConfig(
+        host="127.0.0.1", port=8086, database=tmp_path / "test.db",
+        routing=RoutingConfig(),
+        targets=(TargetConfig("test", "Test", "http://router/v1", "test-model", local=True),),
+    )
+    store = Store(config.database, ["test"])
+
+    def handler(request):
+        raise httpx.TimeoutException("simulated timeout")
+
+    async def run():
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        router = ModelRouter(config, store, client)
+        payload = {"messages": [{"role": "user", "content": "hi"}]}
+        with pytest.raises(UpstreamFailure) as exc:
+            async for _ in router._stream_call(config.targets[0], payload):
+                pass
+        assert exc.value.status == 504
+
+    asyncio.run(run())
     store.close()

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import random
 import time
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
 
@@ -250,6 +252,66 @@ class ModelRouter:
         body["model"] = target.model
         return CompletionResult(body=body, target=target, latency_ms=latency_ms)
 
+    async def _stream_call(
+        self, target: TargetConfig, payload: dict[str, Any], probe: bool = False
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Send a streaming request and yield normalized SSE chunks.
+
+        Each yielded dict is a single SSE ``data:`` chunk normalized to the
+        OpenAI chat.completion.chunk schema.  Raises ``UpstreamFailure``
+        **before** the first chunk is yielded — after the first chunk the
+        caller should consider the stream committed and not attempt fallback.
+        """
+        request = _upstream_payload(payload, target, probe)
+        request["stream"] = True
+        headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}
+        if target.api_key:
+            headers["Authorization"] = f"Bearer {target.api_key}"
+        _first_yielded = False
+        started = time.monotonic()
+        try:
+            async with self._semaphores[target.id]:
+                response = await self.client.post(
+                    target.chat_url, headers=headers, json=request
+                )
+            if response.status_code < 200 or response.status_code >= 300:
+                raise UpstreamFailure(
+                    target, response.status_code, _error_message(response)
+                )
+            latency_ms = (time.monotonic() - started) * 1000
+            async for line in response.aiter_lines():
+                line = line.strip()
+                if not line.startswith("data: "):
+                    continue
+                data = line[6:]
+                if data == "[DONE]":
+                    return
+                try:
+                    chunk = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                normalized = _normalize_stream_chunk(chunk, target.model)
+                if not _first_yielded:
+                    _first_yielded = True
+                    self.store.record_success(
+                        target.id, latency_ms, self.config.routing.ewma_alpha, probe
+                    )
+                yield normalized
+        except UpstreamFailure as error:
+            if not _first_yielded:
+                self._record_failure(target, error.status, str(error), probe)
+            raise
+        except httpx.TimeoutException as error:
+            failure = UpstreamFailure(target, 504, f"timeout: {error}")
+            if not _first_yielded:
+                self._record_failure(target, failure.status, str(failure), probe)
+            raise failure from error
+        except (httpx.HTTPError, ValueError, TypeError) as error:
+            failure = UpstreamFailure(target, 502, f"invalid upstream response: {error}")
+            if not _first_yielded:
+                self._record_failure(target, failure.status, str(failure), probe)
+            raise failure from error
+
     def _record_failure(
         self, target: TargetConfig, status: int, message: str, probe: bool
     ) -> None:
@@ -362,3 +424,23 @@ def _error_message(response: httpx.Response) -> str:
         return str(error)[:500]
     except (ValueError, TypeError):
         return response.text[:500]
+
+
+def _normalize_stream_chunk(chunk: dict, target_model: str) -> dict:
+    """Normalize an upstream SSE chunk to OpenAI chat.completion.chunk format."""
+    choices = chunk.get("choices", [])
+    normalized_choices = []
+    for c in choices:
+        delta = c.get("delta", c.get("message", {}))
+        normalized_choices.append({
+            "index": c.get("index", 0),
+            "delta": delta,
+            "finish_reason": c.get("finish_reason"),
+        })
+    return {
+        "id": chunk.get("id", ""),
+        "object": "chat.completion.chunk",
+        "created": chunk.get("created", int(time.time())),
+        "model": target_model,
+        "choices": normalized_choices,
+    }
