@@ -179,9 +179,35 @@ tests/test_store.py (3 passed)
 5. ✅ 重启服务：`systemctl restart damselfish.service`
 6. ✅ 验证：`curl http://127.0.0.1:18086/health` 返回 `status: ok`
 
-## 10. 后续建议
+## 10. 最终确认
+
+北京服务器部署完成，修复完全生效：
+
+```bash
+# 服务状态
+$ systemctl is-active damselfish
+active
+
+# 健康检查 → 21 目标全部可用
+$ curl http://127.0.0.1:18086/health
+{"status":"ok","available_targets":["beijing-llm-router","zhipu-glm-4v-flash",...]}
+
+# 智谱节点自动带 max_context
+$ curl -s http://127.0.0.1:18086/stats | jq '.targets | with_entries(select(.key | startswith("zhipu")))'
+zhipu-glm-4v-flash:          max_context=16384
+zhipu-glm-4.1v-thinking-flash: max_context=16384
+zhipu-glm-4.6v-flash:         max_context=16384
+zhipu-glm-4-flash-250414:     max_context=128000
+zhipu-glm-4.5-flash:          max_context=128000
+zhipu-glm-4.7-flash:          max_context=128000
+```
+
+**结论**: 使用 damselfish 的用户不会再到 `HTTP 400 inputs tokens + max_new_tokens must be <= 16384` 错误。
+
+## 11. 后续建议
 
 - 为其他免费模型（Kilo、Pollinations）也添加 `max_context` 限制
 - 考虑在管理页面展示每个节点的 `max_context` 信息
 - 监控日志中的 "capping max_new_tokens" 警告，调整估算算法精度
 - 为智谱其他模型（如 glm-4-plus、glm-4-flash 等）补充上下文限制
+- 下次运行 `scripts/sync_free_models.py` 自动同步时，新节点会自动带上 `max_context`
