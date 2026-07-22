@@ -138,13 +138,46 @@ tests/test_store.py (3 passed)
 ======================= 32 passed, 1 warning in 15.88s =======================
 ```
 
+### 第二轮：CJK 感知估算修正 + 36 个新测试
+
+- **问题**: 原估算 `len/2.5` 对中文过于乐观，导致 70655 tokens 仍未被过滤
+- **修复**: 改用 CJK 字符感知估算，识别中文字符按 1.5 tokens/char，非 CJK 按 0.25 tokens/char，附加 10% 安全裕量
+- **新增测试**: 36 个新测试，覆盖 token 估算、max_context 过滤、安全封顶、400 回退、节点管理、端到端
+
+```
+tests/test_app.py (4 passed)
+tests/test_git_sync.py (3 passed)
+tests/test_nodes.py (13 passed)
+tests/test_router.py (32 passed)
+tests/test_selector.py (13 passed)
+tests/test_store.py (3 passed)
+======================= 68 passed, 1 warning in 4.17s =======================
+```
+
+### 北京服务器部署状态
+
+- 代码已推送至 GitHub 并拉取到服务器
+- `managed-nodes.json` 中 6 个智谱节点已设置 `max_context`
+- 服务已重启，健康检查通过，21 个目标全部可用
+- 已生效的 `max_context` 配置：
+
+| 节点 | 模型 | max_context |
+|------|------|------------|
+| zhipu-glm-4v-flash | glm-4v-flash | 16384 |
+| zhipu-glm-4.1v-thinking-flash | glm-4.1v-thinking-flash | 16384 |
+| zhipu-glm-4.6v-flash | glm-4.6v-flash | 16384 |
+| zhipu-glm-4-flash-250414 | glm-4-flash-250414 | 128000 |
+| zhipu-glm-4.5-flash | glm-4.5-flash | 128000 |
+| zhipu-glm-4.7-flash | glm-4.7-flash | 128000 |
+
 ## 9. 部署步骤
 
-1. 将修改后的代码推送到北京服务器
-2. 更新 `config.yml` 中智谱相关节点，添加 `max_context: 16384`
-3. 运行 `scripts/sync_free_models.py` 重新同步节点（自动带上 max_context）
-4. 重启服务：`systemctl restart damselfish.service`
-5. 验证：`curl http://127.0.0.1:18086/health`
+1. ✅ 将修改后的代码推送到北京服务器 (`git push origin main`)
+2. ✅ 服务器拉取代码 (`cd /opt/damselfish && git pull`)
+3. ✅ 运行测试确认无破坏 (`68 passed`)
+4. ✅ 更新 `managed-nodes.json` 中智谱节点的 `max_context`
+5. ✅ 重启服务：`systemctl restart damselfish.service`
+6. ✅ 验证：`curl http://127.0.0.1:18086/health` 返回 `status: ok`
 
 ## 10. 后续建议
 
