@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import random
+import re
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -615,21 +616,34 @@ def _is_context_overflow(error: UpstreamFailure) -> bool:
 def _estimate_current_input_tokens(messages: list[dict[str, Any]]) -> int:
     """Quick token estimation for the current request's messages.
 
-    Uses the same heuristic as selector._estimate_messages_tokens.
+    Uses the same CJK-aware heuristic as selector._estimate_messages_tokens.
     """
     total = 0
     for message in messages:
         content = message.get("content")
         if isinstance(content, str):
-            total += max(1, int(len(content) / 2.5))
+            total += _estimate_text_tokens(content)
         elif isinstance(content, list):
             for part in content:
                 if isinstance(part, dict):
                     text = part.get("text") or part.get("content") or ""
                     if isinstance(text, str):
-                        total += max(1, int(len(text) / 2.5))
+                        total += _estimate_text_tokens(text)
         total += 4
     return total
+
+
+_CJK_RE = re.compile(r"[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]")
+
+
+def _estimate_text_tokens(text: str) -> int:
+    """Estimate tokens for a text string, accounting for CJK density."""
+    if not text:
+        return 0
+    cjk = len(_CJK_RE.findall(text))
+    other = len(text) - cjk
+    estimate = cjk * 1.5 + other * 0.25
+    return max(1, int(estimate * 1.1))
 
 
 def _validate_completion(body: Any) -> None:
