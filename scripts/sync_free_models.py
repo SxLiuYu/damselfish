@@ -45,6 +45,26 @@ ZHIPU_CONTEXT_LIMITS: dict[str, int] = {
     "glm-4v": 16384,
 }
 
+# Known context limits for Kilo free models (tokens).
+# Kilo API may include context_length per model; this dict provides fallbacks
+# for models where the catalog omits the field.
+KILO_CONTEXT_LIMITS: dict[str, int] = {
+    "google/gemma-3-1b-it:free": 8192,
+    "google/gemma-3-4b-it:free": 8192,
+    "meta-llama/llama-3.1-8b-instruct:free": 8192,
+    "meta-llama/llama-3.2-3b-instruct:free": 8192,
+    "qwen/qwen-2.5-7b-instruct:free": 8192,
+    "qwen/qwen-2.5-coder-7b-instruct:free": 8192,
+}
+
+# Known context limits for Pollinations free models (tokens).
+# Pollinations anonymous tier typically uses 8K context.
+POLLINATIONS_CONTEXT_LIMITS: dict[str, int] = {
+    "openai": 8192,
+    "mistral": 8192,
+    "llama": 8192,
+}
+
 
 class DiscoveryError(RuntimeError):
     pass
@@ -103,6 +123,32 @@ def is_chat_compatible(model: dict[str, Any]) -> bool:
 def slugify(value: str) -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
     return slug[:100]
+
+
+def _kilo_context(entry: dict[str, Any], model_id: str) -> int | None:
+    """Extract context length from Kilo catalog entry, falling back to known limits."""
+    raw = entry.get("context_length")
+    if raw is not None:
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            pass
+    return KILO_CONTEXT_LIMITS.get(model_id)
+
+
+def _pollinations_context(entry: dict[str, Any], model_name: str) -> int | None:
+    """Extract context length from Pollinations catalog entry, falling back to known limits."""
+    raw = entry.get("maxLength")
+    if raw is not None:
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            pass
+    # Fall back by matching model name prefix
+    for prefix, limit in POLLINATIONS_CONTEXT_LIMITS.items():
+        if model_name.lower().startswith(prefix):
+            return limit
+    return None
 
 
 def common_node(
@@ -172,6 +218,7 @@ def discover_kilo(client: httpx.Client, fixture_dir: Path | None) -> Discovery:
                 provider="kilo",
                 priority=30 + len(free_models),
                 capabilities=capabilities,
+                max_context=_kilo_context(entry, model_id),
             )
         )
     if not entries:
@@ -204,6 +251,7 @@ def discover_pollinations(client: httpx.Client, fixture_dir: Path | None) -> Dis
                 priority=50 + len(free_models),
                 capabilities=capabilities,
                 scenarios=["default", "tool", "coding", "reasoning", "translation"],
+                max_context=_pollinations_context(entry, name),
             )
         )
     if not payload:

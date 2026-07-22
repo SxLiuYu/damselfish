@@ -166,16 +166,30 @@ def test_streaming_chat_completion_with_historical_stats_columns(
     )
     store = Store(config.database, [target.id])
     store.close()
+    # Simulate a legacy database without token columns
     with sqlite3.connect(config.database) as connection:
+        connection.execute("DROP TABLE target_stats")
         connection.execute(
-            "ALTER TABLE target_stats ADD COLUMN prompt_tokens INTEGER NOT NULL DEFAULT 0"
+            """
+            CREATE TABLE target_stats (
+                target_id TEXT PRIMARY KEY,
+                requests INTEGER NOT NULL DEFAULT 0,
+                successes INTEGER NOT NULL DEFAULT 0,
+                failures INTEGER NOT NULL DEFAULT 0,
+                rate_limits INTEGER NOT NULL DEFAULT 0,
+                consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                ewma_latency_ms REAL,
+                last_latency_ms REAL,
+                last_success_at REAL,
+                last_failure_at REAL,
+                last_probe_at REAL,
+                circuit_open_until REAL NOT NULL DEFAULT 0,
+                last_error TEXT,
+                cap_count INTEGER NOT NULL DEFAULT 0
+            )
+            """
         )
-        connection.execute(
-            "ALTER TABLE target_stats ADD COLUMN completion_tokens INTEGER NOT NULL DEFAULT 0"
-        )
-        connection.execute(
-            "ALTER TABLE target_stats ADD COLUMN total_tokens INTEGER NOT NULL DEFAULT 0"
-        )
+        connection.execute("INSERT INTO target_stats(target_id) VALUES (?)", (target.id,))
 
     upstream_body = (
         'data: {"id":"x","choices":[{"delta":{"role":"assistant"},'
@@ -389,4 +403,105 @@ def test_compress_conversation_uses_chinese_prompt(tmp_path: Path) -> None:
     # Verify it's a summary prompt, not English
     assert "summarize" not in prompt.lower()
     assert "Please" not in prompt
+    store.close()
+
+
+def test_compress_conversation_sets_estimated_input_tokens(tmp_path: Path) -> None:
+    """Compression RouteContext includes estimated_input_tokens so that
+    max_context filtering works correctly for the compression request."""
+    from damselfish.app import _compress_conversation
+    from damselfish.store import Store
+    from damselfish.router import ModelRouter
+
+    # A target with a small context window
+    small_target = TargetConfig(
+        "small", "Small", "http://router/v1", "small-model",
+        local=True, priority=1, probe=False, max_context=4096,
+    )
+    # A target with a large context window
+    large_target = TargetConfig(
+        "large", "Large", "http://router/v1", "large-model",
+        local=True, priority=2, probe=False, max_context=128000,
+    )
+    config = AppConfig(
+        host="127.0.0.1", port=8086, database=tmp_path / "test.db",
+        routing=RoutingConfig(priority_weight_ms=1),
+        targets=(small_target, large_target),
+    )
+    store = Store(config.database, ["small", "large"])
+
+    # Build a long conversation that would trigger compression
+    # Use long messages so the compression prompt exceeds the small target's
+    # 4096-token context window, forcing routing to the large target.
+    messages = [{"role": "user", "content": "中" * 200 + f" msg {i}"} for i in range(35)]
+    messages.append({"role": "assistant", "content": "ok"})
+
+    captured_model = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = __import__("json").loads(request.content)
+        captured_model.append(payload.get("model"))
+        return httpx.Response(
+            200,
+            json={"id": "ok", "choices": [{"message": {"role": "assistant", "content": "摘要"}, "finish_reason": "stop"}]},
+        )
+
+    async def run() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            router = ModelRouter(config, store, client)
+            await _compress_conversation(store, router, "est-session", messages, 10)
+
+    asyncio.run(run())
+    # Should have routed to the large-context target, not the small one
+    assert captured_model == ["large-model"], f"expected large-model, got {captured_model}"
+    store.close()
+
+
+def test_compress_conversation_requires_chat_capability(tmp_path: Path) -> None:
+    """Compression request requires 'chat' capability so that non-chat targets
+    are filtered out."""
+    from damselfish.app import _compress_conversation
+    from damselfish.store import Store
+    from damselfish.router import ModelRouter
+
+    # A target without chat capability
+    non_chat_target = TargetConfig(
+        "embed", "Embed", "http://router/v1", "embed-model",
+        local=True, priority=1, probe=False,
+        capabilities=frozenset({"fast"}),
+    )
+    # A target with chat capability
+    chat_target = TargetConfig(
+        "chat", "Chat", "http://router/v1", "chat-model",
+        local=True, priority=2, probe=False,
+        capabilities=frozenset({"chat", "fast"}),
+    )
+    config = AppConfig(
+        host="127.0.0.1", port=8086, database=tmp_path / "test.db",
+        routing=RoutingConfig(priority_weight_ms=1),
+        targets=(non_chat_target, chat_target),
+    )
+    store = Store(config.database, ["embed", "chat"])
+
+    messages = [{"role": "user", "content": f"msg {i}"} for i in range(35)]
+    messages.append({"role": "assistant", "content": "ok"})
+
+    captured_model = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = __import__("json").loads(request.content)
+        captured_model.append(payload.get("model"))
+        return httpx.Response(
+            200,
+            json={"id": "ok", "choices": [{"message": {"role": "assistant", "content": "摘要"}, "finish_reason": "stop"}]},
+        )
+
+    async def run() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            router = ModelRouter(config, store, client)
+            await _compress_conversation(store, router, "cap-session", messages, 10)
+
+    asyncio.run(run())
+    # Should have routed to the chat target, not the non-chat one
+    assert captured_model == ["chat-model"], f"expected chat-model, got {captured_model}"
     store.close()

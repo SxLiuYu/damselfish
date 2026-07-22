@@ -4,7 +4,6 @@ import asyncio
 import json
 import logging
 import random
-import re
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -15,6 +14,7 @@ import httpx
 from .config import AppConfig, TargetConfig
 from .selector import RouteContext, rank_targets
 from .store import Store
+from .tokens import estimate_text_tokens, estimate_messages_tokens
 
 log = logging.getLogger("damselfish.router")
 
@@ -377,7 +377,9 @@ class ModelRouter:
     async def _call(
         self, target: TargetConfig, payload: dict[str, Any], probe: bool = False
     ) -> CompletionResult:
-        request = _upstream_payload(payload, target, probe)
+        request, capped = _upstream_payload(payload, target, probe)
+        if capped:
+            self.store.record_cap(target.id)
         headers = {"Content-Type": "application/json"}
         if target.api_key:
             headers["Authorization"] = f"Bearer {target.api_key}"
@@ -410,6 +412,16 @@ class ModelRouter:
         self.store.record_success(
             target.id, latency_ms, self.config.routing.ewma_alpha, probe
         )
+        # Capture upstream token usage (if provided)
+        if not probe:
+            usage = body.get("usage")
+            if isinstance(usage, dict):
+                self.store.record_usage(
+                    target.id,
+                    prompt_tokens=int(usage.get("prompt_tokens", 0) or 0),
+                    completion_tokens=int(usage.get("completion_tokens", 0) or 0),
+                    total_tokens=int(usage.get("total_tokens", 0) or 0),
+                )
         body["model"] = target.model
         return CompletionResult(body=body, target=target, latency_ms=latency_ms)
 
@@ -423,7 +435,9 @@ class ModelRouter:
         **before** the first chunk is yielded — after the first chunk the
         caller should consider the stream committed and not attempt fallback.
         """
-        request = _upstream_payload(payload, target, probe)
+        request, capped = _upstream_payload(payload, target, probe)
+        if capped:
+            self.store.record_cap(target.id)
         request["stream"] = True
         headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}
         if target.api_key:
@@ -452,6 +466,16 @@ class ModelRouter:
                 )
                 _first_yielded = True
                 yield normalized
+                # Capture usage from non-streaming JSON body
+                if not probe:
+                    usage = body.get("usage")
+                    if isinstance(usage, dict):
+                        self.store.record_usage(
+                            target.id,
+                            prompt_tokens=int(usage.get("prompt_tokens", 0) or 0),
+                            completion_tokens=int(usage.get("completion_tokens", 0) or 0),
+                            total_tokens=int(usage.get("total_tokens", 0) or 0),
+                        )
                 return
             async for line in response.aiter_lines():
                 line = line.strip()
@@ -470,6 +494,16 @@ class ModelRouter:
                     self.store.record_success(
                         target.id, latency_ms, self.config.routing.ewma_alpha, probe
                     )
+                # Capture usage from last chunk (some providers send it)
+                if not probe:
+                    usage = chunk.get("usage")
+                    if isinstance(usage, dict):
+                        self.store.record_usage(
+                            target.id,
+                            prompt_tokens=int(usage.get("prompt_tokens", 0) or 0),
+                            completion_tokens=int(usage.get("completion_tokens", 0) or 0),
+                            total_tokens=int(usage.get("total_tokens", 0) or 0),
+                        )
                 yield normalized
         except UpstreamFailure as error:
             if not _first_yielded:
@@ -560,17 +594,18 @@ UPSTREAM_FIELDS = {
 
 def _upstream_payload(
     payload: dict[str, Any], target: TargetConfig, probe: bool
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], bool]:
     request = {key: value for key, value in payload.items() if key in UPSTREAM_FIELDS}
     request["model"] = target.model
     request["stream"] = False
     if probe:
         request.pop("tools", None)
         request.pop("tool_choice", None)
-        return request
+        return request, False
     # Cap max_new_tokens when max_context is set to avoid 400 errors
+    capped = False
     if target.max_context is not None:
-        inputs_tokens = _estimate_current_input_tokens(request.get("messages", []))
+        inputs_tokens = estimate_messages_tokens(request.get("messages", []))
         max_new = request.get("max_tokens", request.get("max_completion_tokens", 1024))
         if max_new is None:
             max_new = 1024
@@ -578,6 +613,7 @@ def _upstream_payload(
         if allowed < 1:
             allowed = 1  # Allow at least 1 token to avoid zero-value errors
         if max_new > allowed:
+            capped = True
             log.warning(
                 "capping max_new_tokens for %s: %d -> %d (inputs=%d, max_context=%d)",
                 target.id, max_new, allowed, inputs_tokens, target.max_context,
@@ -586,7 +622,7 @@ def _upstream_payload(
                 request["max_tokens"] = max(1, int(allowed))
             if "max_completion_tokens" in request:
                 request["max_completion_tokens"] = max(1, int(allowed))
-    return request
+    return request, capped
 
 
 def _max_new_tokens(payload: dict[str, Any]) -> int:
@@ -613,37 +649,14 @@ def _is_context_overflow(error: UpstreamFailure) -> bool:
     return any(marker in message for marker in _OVERFLOW_MARKERS)
 
 
-def _estimate_current_input_tokens(messages: list[dict[str, Any]]) -> int:
-    """Quick token estimation for the current request's messages.
-
-    Uses the same CJK-aware heuristic as selector._estimate_messages_tokens.
-    """
-    total = 0
-    for message in messages:
-        content = message.get("content")
-        if isinstance(content, str):
-            total += _estimate_text_tokens(content)
-        elif isinstance(content, list):
-            for part in content:
-                if isinstance(part, dict):
-                    text = part.get("text") or part.get("content") or ""
-                    if isinstance(text, str):
-                        total += _estimate_text_tokens(text)
-        total += 4
-    return total
+# Backward-compatible aliases (tests import these private names directly).
+# They delegate to the shared damselfish.tokens module so behaviour stays
+# identical across selector and router.
+_estimate_text_tokens = estimate_text_tokens
+_estimate_current_input_tokens = estimate_messages_tokens
 
 
-_CJK_RE = re.compile(r"[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]")
 
-
-def _estimate_text_tokens(text: str) -> int:
-    """Estimate tokens for a text string, accounting for CJK density."""
-    if not text:
-        return 0
-    cjk = len(_CJK_RE.findall(text))
-    other = len(text) - cjk
-    estimate = cjk * 1.5 + other * 0.25
-    return max(1, int(estimate * 1.1))
 
 
 def _validate_completion(body: Any) -> None:

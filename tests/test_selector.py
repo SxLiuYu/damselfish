@@ -49,26 +49,35 @@ def test_tools_require_capable_target(tmp_path: Path) -> None:
 
 def test_estimate_text_tokens_pure_chinese() -> None:
     """Pure Chinese: ~1.5 tokens/char × 1.1 safety margin."""
+    from damselfish import tokens
     text = "中" * 1000
     estimated = _estimate_text_tokens(text)
-    # 1000 CJK chars × 1.5 × 1.1 = 1650
-    assert estimated == 1650, f"expected 1650, got {estimated}"
+    if tokens._TIKTOKEN_ENCODING is not None:
+        assert estimated == 1000, f"tiktoken expected 1000, got {estimated}"
+    else:
+        assert estimated == 1650, f"expected 1650, got {estimated}"
 
 
 def test_estimate_text_tokens_pure_english() -> None:
     """Pure English: ~0.25 tokens/char × 1.1 safety margin."""
+    from damselfish import tokens
     text = "hello world " * 100  # 1200 chars
     estimated = _estimate_text_tokens(text)
-    # 1200 × 0.25 × 1.1 = 330
-    assert estimated == 330, f"expected 330, got {estimated}"
+    if tokens._TIKTOKEN_ENCODING is not None:
+        assert estimated == 201, f"tiktoken expected 201, got {estimated}"
+    else:
+        assert estimated == 330, f"expected 330, got {estimated}"
 
 
 def test_estimate_text_tokens_mixed() -> None:
     """Chinese + English: weighted sum."""
+    from damselfish import tokens
     text = "中" * 500 + "hello " * 100  # 500 CJK + 600 ASCII = 1100 chars
     estimated = _estimate_text_tokens(text)
-    # 500×1.5 + 600×0.25 = 750+150 = 900; ×1.1 = 990
-    assert estimated == 990, f"expected 990, got {estimated}"
+    if tokens._TIKTOKEN_ENCODING is not None:
+        assert estimated == 601, f"tiktoken expected 601, got {estimated}"
+    else:
+        assert estimated == 990, f"expected 990, got {estimated}"
 
 
 def test_estimate_text_tokens_empty() -> None:
@@ -79,6 +88,7 @@ def test_estimate_text_tokens_empty() -> None:
 
 def test_estimate_messages_tokens_multimodal() -> None:
     """Multimodal messages: only text parts are counted."""
+    from damselfish import tokens
     messages: list[dict[str, Any]] = [
         {"role": "user", "content": "图文并茂的描述"},
         {"role": "user", "content": [
@@ -87,8 +97,12 @@ def test_estimate_messages_tokens_multimodal() -> None:
         ]},
     ]
     estimated = _estimate_messages_tokens(messages)
-    # 7 CJK chars: int(7*1.5*1.1)=11  +  4 CJK chars: int(4*1.5*1.1)=6  +  2*4 overhead=8
-    assert estimated == 11 + 6 + 8, f"got {estimated}"
+    if tokens._TIKTOKEN_ENCODING is not None:
+        # 7 + 2 + 2*4 overhead = 17
+        assert estimated == 17, f"tiktoken got {estimated}"
+    else:
+        # heuristic: 7*1.5*1.1=11 + 4*1.5*1.1=6 + 8 = 25
+        assert estimated == 25, f"heuristic got {estimated}"
 
 
 def test_estimate_messages_tokens_empty() -> None:
@@ -102,10 +116,16 @@ def test_estimate_messages_tokens_overestimates_safely() -> None:
     For pure Chinese, 1 token ≈ 1.5 chars, so our estimate (1.5×1.1=1.65 chars/token)
     should be conservative (slightly overestimate).
     """
+    from damselfish import tokens
     text = "中" * 1000
     estimated = _estimate_text_tokens(text)
-    # Real token count for 1000 CJK chars ≈ 1500. Our estimate = 1650 (10% overhead)
-    assert estimated > 1500, "estimate should be conservative for CJK"
+    if tokens._TIKTOKEN_ENCODING is not None:
+        # tiktoken: 1000 tokens. Heuristic should be >= that.
+        heuristic = tokens._estimate_text_heuristic(text)
+        assert heuristic > estimated, "heuristic should be >= tiktoken"
+    else:
+        # Real token count for 1000 CJK chars ≈ 1500. Our estimate = 1650 (10% overhead)
+        assert estimated > 1500, "estimate should be conservative for CJK"
 
 
 # ── max_context filtering tests ──────────────────────────────────────

@@ -437,17 +437,19 @@ async def _compress_conversation(store, router, session_id, messages, keep):
             "涵盖用户需求、已解决的问题和关键决策。\n"
             "保留足够细节以保持对话连续性。最多 200 字。\n\n" + text
         )
-        from .selector import RouteContext, _estimate_messages_tokens
-        # Use auto-routing with "fast" preference instead of hardcoded target
-        ctx = RouteContext(
-            scenario="default", persona=None,
-            required=frozenset(), preferred=frozenset({"fast"}),
-            preferred_targets=(),
-        )
+        from .selector import RouteContext
+        from .tokens import estimate_messages_tokens
         payload = {
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": 400, "temperature": 0.5,
         }
+        # Use auto-routing with "fast" preference instead of hardcoded target
+        ctx = RouteContext(
+            scenario="default", persona=None,
+            required=frozenset({"chat"}), preferred=frozenset({"fast"}),
+            preferred_targets=(),
+            estimated_input_tokens=estimate_messages_tokens(payload["messages"]),
+        )
         result = await router.complete(payload, ctx, None)
         summary = result.body["choices"][0]["message"].get("content", "")
         if not summary:
@@ -456,8 +458,8 @@ async def _compress_conversation(store, router, session_id, messages, keep):
             {"role": "system", "content": "对话摘要：" + summary}
         ] + recent
         # Verify compression actually reduced token count
-        old_tokens = _estimate_messages_tokens(messages)
-        new_tokens = _estimate_messages_tokens(compressed)
+        old_tokens = estimate_messages_tokens(messages)
+        new_tokens = estimate_messages_tokens(compressed)
         if new_tokens >= old_tokens:
             log.info("compression skipped for %s: tokens %d -> %d (no reduction)",
                      session_id[:8], old_tokens, new_tokens)

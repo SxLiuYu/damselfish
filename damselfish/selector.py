@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import re
 import time
 from dataclasses import dataclass
 from typing import Any
 
 from .config import AppConfig, TargetConfig
 from .store import TargetStats
+from .tokens import estimate_messages_tokens, estimate_text_tokens
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,7 +82,7 @@ def infer_context(
         required=frozenset(required),
         preferred=frozenset(preferred),
         preferred_targets=tuple(dict.fromkeys(preferred_targets)),
-        estimated_input_tokens=_estimate_messages_tokens(messages),
+        estimated_input_tokens=estimate_messages_tokens(messages),
     )
 
 
@@ -125,47 +125,9 @@ def rank_targets(
     return [target for _, target in ranked]
 
 
-def _estimate_messages_tokens(messages: list[dict[str, Any]]) -> int:
-    """Estimate input tokens from messages (character-aware heuristic).
-
-    CJK characters tokenize densely (~1.5 tokens/char) while ASCII text is
-    sparse (~0.25 tokens/char).  We detect the CJK ratio per message and scale
-    accordingly so that Chinese-heavy conversations are not underestimated.
-    Each message also adds ~4 tokens of structural overhead (role markers, etc.).
-    """
-    total = 0
-    for message in messages:
-        content = message.get("content")
-        if isinstance(content, str):
-            total += _estimate_text_tokens(content)
-        elif isinstance(content, list):
-            # Multimodal: estimate text parts only
-            for part in content:
-                if isinstance(part, dict):
-                    text = part.get("text")
-                    if not isinstance(text, str):
-                        text = part.get("content")
-                    if isinstance(text, str):
-                        total += _estimate_text_tokens(text)
-        total += 4  # structural overhead per message
-    return total
-
-
-_CJK_RE = re.compile(r"[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]")
-
-
-def _estimate_text_tokens(text: str) -> int:
-    """Estimate tokens for a text string, accounting for CJK density.
-
-    CJK characters tokenize at ~1.5 tokens/char; other characters at ~0.25.
-    A 10% safety margin is added so we err on the side of overestimating.
-    """
-    if not text:
-        return 0
-    cjk = len(_CJK_RE.findall(text))
-    other = len(text) - cjk
-    estimate = cjk * 1.5 + other * 0.25
-    return max(1, int(estimate * 1.1))
+# Re-export for backward compatibility (tests import these directly)
+_estimate_messages_tokens = estimate_messages_tokens
+_estimate_text_tokens = estimate_text_tokens
 
 
 def _contains_image(messages: list[dict[str, Any]]) -> bool:

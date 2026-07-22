@@ -25,6 +25,10 @@ class TargetStats:
     last_probe_at: float | None = None
     circuit_open_until: float = 0.0
     last_error: str | None = None
+    cap_count: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
 
     def public(self) -> dict[str, Any]:
         data = asdict(self)
@@ -68,7 +72,11 @@ class Store:
                     last_failure_at REAL,
                     last_probe_at REAL,
                     circuit_open_until REAL NOT NULL DEFAULT 0,
-                    last_error TEXT
+                    last_error TEXT,
+                    cap_count INTEGER NOT NULL DEFAULT 0,
+                    prompt_tokens INTEGER NOT NULL DEFAULT 0,
+                    completion_tokens INTEGER NOT NULL DEFAULT 0,
+                    total_tokens INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE TABLE IF NOT EXISTS sessions (
                     session_id TEXT PRIMARY KEY,
@@ -122,6 +130,21 @@ class Store:
                     ON memory_events(synced, created_at);
                 """
             )
+            # Schema migration: add cap_count to existing databases
+            try:
+                self._connection.execute(
+                    "ALTER TABLE target_stats ADD COLUMN cap_count INTEGER NOT NULL DEFAULT 0",
+                )
+            except Exception:
+                pass  # Column already exists
+            # Schema migration: add token usage columns to existing databases
+            for col in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                try:
+                    self._connection.execute(
+                        f"ALTER TABLE target_stats ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0",
+                    )
+                except Exception:
+                    pass  # Column already exists
             self._connection.executemany(
                 "INSERT OR IGNORE INTO target_stats(target_id) VALUES (?)",
                 [(target_id,) for target_id in target_ids],
@@ -204,6 +227,41 @@ class Store:
                     error[:500],
                     target_id,
                 ),
+            )
+
+    def record_cap(self, target_id: str) -> None:
+        """Increment the cap_count counter when max_new_tokens is capped."""
+        with self._lock, self._connection:
+            self._connection.execute(
+                "UPDATE target_stats SET cap_count = cap_count + 1 WHERE target_id = ?",
+                (target_id,),
+            )
+
+    def record_usage(
+        self,
+        target_id: str,
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        total_tokens: int = 0,
+    ) -> None:
+        """Accumulate token usage from upstream ``usage`` fields.
+
+        Called after a successful completion (streaming or non-streaming)
+        when the upstream response includes a ``usage`` object.  Values are
+        accumulated per-target so the stats endpoint can report totals.
+        """
+        if not (prompt_tokens or completion_tokens or total_tokens):
+            return
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                UPDATE target_stats SET
+                    prompt_tokens = prompt_tokens + ?,
+                    completion_tokens = completion_tokens + ?,
+                    total_tokens = total_tokens + ?
+                WHERE target_id = ?
+                """,
+                (prompt_tokens, completion_tokens, total_tokens, target_id),
             )
 
     def record_decision(

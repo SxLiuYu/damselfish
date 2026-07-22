@@ -556,12 +556,20 @@ def test_max_new_tokens_prefers_max_tokens() -> None:
 
 def test_router_estimate_text_tokens_cjk() -> None:
     """CJK text estimated correctly."""
-    assert _estimate_text_tokens("中" * 1000) == 1650
+    from damselfish import tokens
+    if tokens._TIKTOKEN_ENCODING is not None:
+        assert _estimate_text_tokens("中" * 1000) == 1000
+    else:
+        assert _estimate_text_tokens("中" * 1000) == 1650
 
 
 def test_router_estimate_text_tokens_ascii() -> None:
     """ASCII text estimated correctly."""
-    assert _estimate_text_tokens("hello world " * 100) == 330
+    from damselfish import tokens
+    if tokens._TIKTOKEN_ENCODING is not None:
+        assert _estimate_text_tokens("hello world " * 100) == 201
+    else:
+        assert _estimate_text_tokens("hello world " * 100) == 330
 
 
 def test_router_estimate_current_input_tokens() -> None:
@@ -632,16 +640,20 @@ def test_is_context_overflow_rejects_other_400() -> None:
 
 def test_upstream_payload_caps_max_tokens() -> None:
     """max_tokens is capped when input + max_tokens > max_context."""
+    # Use small max_context so cap triggers in both tiktoken and heuristic.
+    # tiktoken: 1000 CJK = 1000 tokens; heuristic: 1000 CJK = 1650 tokens.
+    # With max_context=1500 and max_tokens=1024, both backends exceed.
     target = TargetConfig(
         "test", "Test", "http://t/v1", "t",
-        local=True, max_context=4096,
+        local=True, max_context=1500,
     )
     payload = {
-        "messages": [{"role": "user", "content": "中" * 2000}],
-        "max_tokens": 2048,
+        "messages": [{"role": "user", "content": "中" * 1000}],
+        "max_tokens": 1024,
     }
-    request = _upstream_payload(payload, target, probe=False)
-    assert request["max_tokens"] < 2048
+    request, capped = _upstream_payload(payload, target, probe=False)
+    assert request["max_tokens"] < 1024
+    assert capped is True
 
 
 def test_upstream_payload_no_cap_within_limit() -> None:
@@ -654,8 +666,9 @@ def test_upstream_payload_no_cap_within_limit() -> None:
         "messages": [{"role": "user", "content": "hi"}],
         "max_tokens": 500,
     }
-    request = _upstream_payload(payload, target, probe=False)
+    request, capped = _upstream_payload(payload, target, probe=False)
     assert request["max_tokens"] == 500
+    assert capped is False
 
 
 def test_upstream_payload_no_max_context() -> None:
@@ -668,8 +681,9 @@ def test_upstream_payload_no_max_context() -> None:
         "messages": [{"role": "user", "content": "中" * 50000}],
         "max_tokens": 99999,
     }
-    request = _upstream_payload(payload, target, probe=False)
+    request, capped = _upstream_payload(payload, target, probe=False)
     assert request["max_tokens"] == 99999
+    assert capped is False
 
 
 def test_upstream_payload_probe_skips_capping() -> None:
@@ -682,9 +696,10 @@ def test_upstream_payload_probe_skips_capping() -> None:
         "messages": [{"role": "user", "content": "中" * 5000}],
         "max_tokens": 99999,
     }
-    request = _upstream_payload(payload, target, probe=True)
+    request, capped = _upstream_payload(payload, target, probe=True)
     assert "tools" not in request
     assert request["max_tokens"] == 99999
+    assert capped is False
 
 
 def test_upstream_payload_caps_max_completion_tokens() -> None:
@@ -697,8 +712,9 @@ def test_upstream_payload_caps_max_completion_tokens() -> None:
         "messages": [{"role": "user", "content": "中" * 1200}],
         "max_completion_tokens": 2048,
     }
-    request = _upstream_payload(payload, target, probe=False)
+    request, capped = _upstream_payload(payload, target, probe=False)
     assert request["max_completion_tokens"] < 2048
+    assert capped is True
 
 
 # ── Router fallback on context overflow 400 ─────────────────────────
@@ -814,4 +830,167 @@ def test_stream_complete_phase1_400_context_overflow_fallback(tmp_path: Path) ->
             assert router._stream_result.target.id == "long"
 
     asyncio.run(run())
+    store.close()
+
+
+# ── cap_count recording ────────────────────────────────────────────
+
+
+def test_router_records_cap_count(tmp_path: Path) -> None:
+    """When max_new_tokens is capped, store.record_cap is called."""
+    from damselfish import tokens
+    # Use a small max_context that triggers cap in both tiktoken and heuristic.
+    # tiktoken: 1000 CJK = 1000 tokens; heuristic: 1000 CJK = 1650 tokens.
+    # With max_context=1500 and max_tokens=1024, both backends exceed.
+    max_context = 1500
+    config = AppConfig(
+        host="127.0.0.1", port=8086, database=tmp_path / "test.db",
+        routing=RoutingConfig(priority_weight_ms=1),
+        targets=(
+            TargetConfig("small", "Small", "http://router/v1", "small",
+                         local=True, priority=1, max_context=max_context),
+        ),
+    )
+    store = Store(config.database, ["small"])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"id": "ok", "choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}]},
+        )
+
+    async def run() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            router = ModelRouter(config, store, client)
+            # Input ~1000 tokens (tiktoken) or ~1650 (heuristic) + max_tokens=1024 > 1500
+            await router.complete(
+                {"model": "auto", "messages": [{"role": "user", "content": "中" * 1000}], "max_tokens": 1024},
+                RouteContext("default", None, frozenset(), frozenset(), ()),
+                "test",
+            )
+
+    asyncio.run(run())
+    assert store.stats("small").cap_count == 1
+    assert store.stats("small").public()["cap_count"] == 1
+    store.close()
+
+
+# ── token usage recording ──────────────────────────────────────────
+
+
+def test_router_records_usage_from_non_streaming(tmp_path: Path) -> None:
+    """Router captures upstream ``usage`` and records it to the store."""
+    config = AppConfig(
+        host="127.0.0.1", port=8086, database=tmp_path / "test.db",
+        routing=RoutingConfig(priority_weight_ms=1),
+        targets=(
+            TargetConfig("t1", "T1", "http://router/v1", "m",
+                         local=True, priority=1),
+        ),
+    )
+    store = Store(config.database, ["t1"])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "id": "ok",
+                "choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150},
+            },
+        )
+
+    async def run() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            router = ModelRouter(config, store, client)
+            await router.complete(
+                {"model": "auto", "messages": [{"role": "user", "content": "hi"}]},
+                RouteContext("default", None, frozenset(), frozenset(), ()),
+                "test",
+            )
+
+    asyncio.run(run())
+    stats = store.stats("t1")
+    assert stats.prompt_tokens == 100
+    assert stats.completion_tokens == 50
+    assert stats.total_tokens == 150
+    store.close()
+
+
+def test_router_records_usage_from_streaming(tmp_path: Path) -> None:
+    """Router captures ``usage`` from the last SSE chunk in streaming mode."""
+    config = AppConfig(
+        host="127.0.0.1", port=8086, database=tmp_path / "test.db",
+        routing=RoutingConfig(priority_weight_ms=1),
+        targets=(
+            TargetConfig("t1", "T1", "http://router/v1", "m",
+                         local=True, priority=1),
+        ),
+    )
+    store = Store(config.database, ["t1"])
+
+    upstream_body = (
+        'data: {"id":"x","choices":[{"delta":{"role":"assistant"},"finish_reason":null}]}\n\n'
+        'data: {"id":"x","choices":[{"delta":{"content":"OK"},"finish_reason":null}]}\n\n'
+        'data: {"id":"x","choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":80,"completion_tokens":40,"total_tokens":120}}\n\n'
+        'data: [DONE]\n\n'
+    ).encode()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=upstream_body)
+
+    async def run() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            router = ModelRouter(config, store, client)
+            chunks = []
+            async for chunk in router.stream_complete(
+                {"model": "auto", "messages": [{"role": "user", "content": "hi"}]},
+                RouteContext("default", None, frozenset(), frozenset(), ()),
+                "test",
+            ):
+                chunks.append(chunk)
+
+    asyncio.run(run())
+    stats = store.stats("t1")
+    assert stats.prompt_tokens == 80
+    assert stats.completion_tokens == 40
+    assert stats.total_tokens == 120
+    store.close()
+
+
+def test_router_no_usage_does_not_break(tmp_path: Path) -> None:
+    """Upstream without ``usage`` field doesn't break the router."""
+    config = AppConfig(
+        host="127.0.0.1", port=8086, database=tmp_path / "test.db",
+        routing=RoutingConfig(priority_weight_ms=1),
+        targets=(
+            TargetConfig("t1", "T1", "http://router/v1", "m",
+                         local=True, priority=1),
+        ),
+    )
+    store = Store(config.database, ["t1"])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "id": "ok",
+                "choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+            },
+        )
+
+    async def run() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            router = ModelRouter(config, store, client)
+            await router.complete(
+                {"model": "auto", "messages": [{"role": "user", "content": "hi"}]},
+                RouteContext("default", None, frozenset(), frozenset(), ()),
+                "test",
+            )
+
+    asyncio.run(run())
+    stats = store.stats("t1")
+    assert stats.prompt_tokens == 0
+    assert stats.completion_tokens == 0
+    assert stats.total_tokens == 0
     store.close()
