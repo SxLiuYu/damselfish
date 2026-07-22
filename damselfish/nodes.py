@@ -120,6 +120,7 @@ def normalize_node(
         "max_concurrency": _bounded_int(
             payload.get("max_concurrency", 4), "最大并发", 1, 100
         ),
+        "max_context": _optional_int(payload.get("max_context"), "上下文上限"),
     }
 
 
@@ -146,6 +147,7 @@ def public_node(target: TargetConfig, *, managed: bool) -> dict[str, Any]:
         "personas": sorted(target.personas),
         "probe": target.probe,
         "max_concurrency": target.max_concurrency,
+        "max_context": target.max_context,
         "has_api_key": bool(target.api_key),
         "managed": managed,
     }
@@ -335,6 +337,15 @@ def _bounded_int(value: Any, name: str, minimum: int, maximum: int) -> int:
     if number < minimum or number > maximum:
         raise NodeValidationError(f"{name}必须在 {minimum} 到 {maximum} 之间")
     return number
+
+
+def _optional_int(value: Any, name: str) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError) as error:
+        raise NodeValidationError(f"{name}必须是整数或空值") from error
 
 
 def _response_error(response: httpx.Response) -> str:

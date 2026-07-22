@@ -69,6 +69,7 @@ class ModelRouter:
             context,
             self.store.all_stats(),
             str(payload.get("model", "auto")),
+            max_new_tokens=_max_new_tokens(payload),
         )
         if not targets:
             raise NoTargetAvailable(
@@ -87,7 +88,7 @@ class ModelRouter:
                 session_id, context.scenario, context.persona, primary.id,
                 None, False, error.status, str(error),
             )
-            if error.status not in (429, 504) or len(targets) < 2:
+            if (error.status not in (429, 504) and not _is_context_overflow(error)) or len(targets) < 2:
                 raise NoTargetAvailable(
                     f"primary target {primary.id} failed: HTTP {error.status} {error}"
                 ) from error
@@ -130,6 +131,7 @@ class ModelRouter:
             context,
             self.store.all_stats(),
             str(payload.get("model", "auto")),
+            max_new_tokens=_max_new_tokens(payload),
         )
         if not targets:
             raise NoTargetAvailable(
@@ -148,7 +150,7 @@ class ModelRouter:
                 session_id, context.scenario, context.persona, primary.id,
                 None, False, error.status, str(error),
             )
-            if error.status not in (429, 504) or len(targets) < 2:
+            if (error.status not in (429, 504) and not _is_context_overflow(error)) or len(targets) < 2:
                 raise NoTargetAvailable(
                     f"primary target {primary.id} failed: HTTP {error.status} {error}"
                 ) from error
@@ -564,7 +566,70 @@ def _upstream_payload(
     if probe:
         request.pop("tools", None)
         request.pop("tool_choice", None)
+        return request
+    # Cap max_new_tokens when max_context is set to avoid 400 errors
+    if target.max_context is not None:
+        inputs_tokens = _estimate_current_input_tokens(request.get("messages", []))
+        max_new = request.get("max_tokens", request.get("max_completion_tokens", 1024))
+        if max_new is None:
+            max_new = 1024
+        allowed = target.max_context - inputs_tokens
+        if allowed < 1:
+            allowed = 1  # Allow at least 1 token to avoid zero-value errors
+        if max_new > allowed:
+            log.warning(
+                "capping max_new_tokens for %s: %d -> %d (inputs=%d, max_context=%d)",
+                target.id, max_new, allowed, inputs_tokens, target.max_context,
+            )
+            if "max_tokens" in request:
+                request["max_tokens"] = max(1, int(allowed))
+            if "max_completion_tokens" in request:
+                request["max_completion_tokens"] = max(1, int(allowed))
     return request
+
+
+def _max_new_tokens(payload: dict[str, Any]) -> int:
+    """Extract max_new_tokens from payload, defaulting to 1024."""
+    return int(payload.get("max_tokens", payload.get("max_completion_tokens", 1024)) or 1024)
+
+
+_OVERFLOW_MARKERS = (
+    "max_new_tokens",
+    "must be <=",
+    "tokens +",
+    "context length",
+    "maximum context",
+    "too long",
+    "too many tokens",
+)
+
+
+def _is_context_overflow(error: UpstreamFailure) -> bool:
+    """Detect upstream 400 errors caused by input exceeding context window."""
+    if error.status != 400:
+        return False
+    message = str(error).lower()
+    return any(marker in message for marker in _OVERFLOW_MARKERS)
+
+
+def _estimate_current_input_tokens(messages: list[dict[str, Any]]) -> int:
+    """Quick token estimation for the current request's messages.
+
+    Uses the same heuristic as selector._estimate_messages_tokens.
+    """
+    total = 0
+    for message in messages:
+        content = message.get("content")
+        if isinstance(content, str):
+            total += max(1, int(len(content) / 2.5))
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict):
+                    text = part.get("text") or part.get("content") or ""
+                    if isinstance(text, str):
+                        total += max(1, int(len(text) / 2.5))
+        total += 4
+    return total
 
 
 def _validate_completion(body: Any) -> None:

@@ -26,6 +26,7 @@ class TargetConfig:
     probe: bool = True
     probe_prompt: str = "Reply OK"
     max_concurrency: int = 4
+    max_context: int | None = None
     api_key_value: str = field(default="", repr=False, compare=False)
 
     @property
@@ -152,6 +153,7 @@ def target_from_mapping(item: dict[str, Any], *, managed: bool = False) -> Targe
         probe=bool(item.get("probe", True)),
         probe_prompt=str(item.get("probe_prompt", "Reply OK")),
         max_concurrency=max(int(item.get("max_concurrency", 4)), 1),
+        max_context=int(item["max_context"]) if item.get("max_context") else None,
         api_key_value=str(item.get("api_key", "")) if managed else "",
     )
 

@@ -38,6 +38,13 @@ EXCLUDED_KILO_IDS = {
 EXCLUDED_ZHIPU_SLUGS = {"cogview-3-flash", "cogvideox-flash"}
 ZHIPU_FREE_LINK_RE = re.compile(r"/cn/guide/models/free/([a-zA-Z0-9._-]+)")
 
+# Known context limits for Zhipu free models (tokens).
+# When a model is not listed here, no limit is enforced (assumed large).
+ZHIPU_CONTEXT_LIMITS: dict[str, int] = {
+    "glm-4v-flash": 16384,
+    "glm-4v": 16384,
+}
+
 
 class DiscoveryError(RuntimeError):
     pass
@@ -109,6 +116,7 @@ def common_node(
     api_key: str = "",
     capabilities: list[str] | None = None,
     scenarios: list[str] | None = None,
+    max_context: int | None = None,
 ) -> dict[str, Any]:
     return {
         "id": node_id,
@@ -126,6 +134,7 @@ def common_node(
         "probe": False,
         "probe_prompt": "OK",
         "max_concurrency": 1,
+        "max_context": max_context,
         "auto_managed": SYNC_TAG,
         "provider": provider,
         "source": "official-catalog",
@@ -232,6 +241,7 @@ def discover_zhipu(client: httpx.Client, fixture_dir: Path | None, nodes: list[d
                 api_key=api_key,
                 capabilities=["chat", "chinese", "multilingual", "coding", "reasoning", "tools", "fast"],
                 scenarios=["default", "tool", "coding", "reasoning", "translation"],
+                max_context=ZHIPU_CONTEXT_LIMITS.get(slug),
             )
         )
     return Discovery("zhipu", models)

@@ -15,6 +15,7 @@ class RouteContext:
     required: frozenset[str]
     preferred: frozenset[str]
     preferred_targets: tuple[str, ...]
+    estimated_input_tokens: int = 0
 
 
 SCENARIO_KEYWORDS = {
@@ -80,6 +81,7 @@ def infer_context(
         required=frozenset(required),
         preferred=frozenset(preferred),
         preferred_targets=tuple(dict.fromkeys(preferred_targets)),
+        estimated_input_tokens=_estimate_messages_tokens(messages),
     )
 
 
@@ -88,6 +90,7 @@ def rank_targets(
     context: RouteContext,
     stats: dict[str, TargetStats],
     requested_model: str | None = None,
+    max_new_tokens: int = 1024,
 ) -> list[TargetConfig]:
     now = time.time()
     ranked: list[tuple[float, TargetConfig]] = []
@@ -97,6 +100,10 @@ def rank_targets(
             continue
         if not context.required.issubset(target.capabilities):
             continue
+        # Filter out targets whose context window is too small for the input
+        if target.max_context is not None:
+            if context.estimated_input_tokens + max_new_tokens > target.max_context:
+                continue
         latency = state.ewma_latency_ms or config.routing.unknown_latency_ms
         attempts = state.successes + state.failures
         failure_rate = state.failures / attempts if attempts else 0.0
@@ -115,6 +122,31 @@ def rank_targets(
         ranked.append((score, target))
     ranked.sort(key=lambda item: (item[0], item[1].id))
     return [target for _, target in ranked]
+
+
+def _estimate_messages_tokens(messages: list[dict[str, Any]]) -> int:
+    """Estimate input tokens from messages (characters + overhead heuristic).
+
+    A rough approximation: 1 token ≈ 3~4 bytes for CJK, 4 chars for English.
+    We use a blended heuristic: tokens ≈ chars / 2.5 for mixed text.
+    Each message adds ~4 tokens of structural overhead (role markers, etc.).
+    """
+    total = 0
+    for message in messages:
+        content = message.get("content")
+        if isinstance(content, str):
+            # CJK characters: ~1.5 tokens per char; ASCII: ~0.25 tokens per char
+            # Blended: len(content) / 2.5 covers most cases
+            total += max(1, int(len(content) / 2.5))
+        elif isinstance(content, list):
+            # Multimodal: estimate text parts only
+            for part in content:
+                if isinstance(part, dict) and isinstance(part.get("text"), str):
+                    total += max(1, int(len(part["text"]) / 2.5))
+                elif isinstance(part, dict) and isinstance(part.get("content"), str):
+                    total += max(1, int(len(part["content"]) / 2.5))
+        total += 4  # structural overhead per message
+    return total
 
 
 def _contains_image(messages: list[dict[str, Any]]) -> bool:
