@@ -63,7 +63,16 @@ def create_app(config: AppConfig | None = None, config_path: str | Path | None =
             yield
         finally:
             stop.set()
-            await asyncio.gather(probe_task, sync_task)
+            # Give in-flight requests up to 10 seconds to finish gracefully.
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(probe_task, sync_task),
+                    timeout=10.0,
+                )
+            except TimeoutError:
+                log.warning("graceful shutdown timed out after 10s, forcing exit")
+                probe_task.cancel()
+                sync_task.cancel()
             await memory_sync.sync_pending(force=True)
             await client.aclose()
             store.close()
@@ -217,15 +226,27 @@ def create_app(config: AppConfig | None = None, config_path: str | Path | None =
     @app.get("/health")
     async def health(request: Request) -> dict[str, Any]:
         stats = request.app.state.store.all_stats()
-        available = [
-            target.id
-            for target in loaded.targets
-            if target.available and stats[target.id].circuit_open_until <= time.time()
-        ]
+        now = time.time()
+        available_targets = []
+        healthy_targets = []
+        for target in loaded.targets:
+            if not target.available:
+                continue
+            state = stats[target.id]
+            if state.circuit_open_until > now:
+                continue
+            available_targets.append(target.id)
+            # A target is "healthy" if it has had a recent successful request
+            # or probe (within 2x the probe stale interval).
+            recent_success = state.last_success_at and (now - state.last_success_at) < loaded.routing.probe_stale_seconds * 2
+            if recent_success or state.successes == 0:
+                healthy_targets.append(target.id)
         return {
-            "status": "ok" if available else "degraded",
-            "uptime_seconds": int(time.time() - request.app.state.started_at),
-            "available_targets": available,
+            "status": "ok" if healthy_targets else "degraded",
+            "uptime_seconds": int(now - request.app.state.started_at),
+            "available_targets": available_targets,
+            "healthy_targets": healthy_targets,
+            "total_targets": len(loaded.targets),
             "memory_sync": request.app.state.memory_sync.status(),
         }
 
@@ -516,22 +537,45 @@ async def _handle_streaming(
     router = request.app.state.router
     loaded = request.app.state.config
     accumulated_content: list[str] = []
+    accumulated_chars: list[int] = [0]
+    _MAX_ACCUMULATED_CHARS = 50000
     first_chunk_time: list[float] = []
 
     async def stream_chunks() -> AsyncIterator[str]:
         target_id = ""
         target_model = ""
         try:
+            first_meta_sent = False
             async for chunk in router.stream_complete(payload, context, decision_session):
                 # Track latency from first chunk
                 if not first_chunk_time:
                     first_chunk_time.append(time.monotonic())
-                # Accumulate content for memory
+                # Inject meta event before the first data chunk so clients
+                # know which target/model is handling the stream (since SSE
+                # headers can't be added after the response starts).
+                if not first_meta_sent:
+                    result = getattr(router, "_stream_result", None)
+                    meta_target = result.target.id if result else ""
+                    meta_model = result.target.model if result else ""
+                    meta_latency = f"{result.latency_ms:.1f}" if result else "0.0"
+                    meta = {
+                        "target": meta_target,
+                        "model": meta_model,
+                        "latency_ms": meta_latency,
+                        "scenario": context.scenario,
+                    }
+                    yield f"event: meta\n"
+                    yield f"data: {json.dumps(meta, ensure_ascii=False)}\n\n"
+                    first_meta_sent = True
+                # Accumulate content for memory (with cap to avoid OOM on huge streams)
                 choices = chunk.get("choices", [])
                 if choices:
                     delta = choices[0].get("delta", {})
                     if isinstance(delta, dict) and delta.get("content"):
-                        accumulated_content.append(delta["content"])
+                        content_piece = delta["content"]
+                        if accumulated_chars[0] < _MAX_ACCUMULATED_CHARS:
+                            accumulated_content.append(content_piece)
+                            accumulated_chars[0] += len(content_piece)
                 if chunk.get("model"):
                     target_model = chunk["model"]
                 yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"

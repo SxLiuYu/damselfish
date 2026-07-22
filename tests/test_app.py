@@ -505,3 +505,69 @@ def test_compress_conversation_requires_chat_capability(tmp_path: Path) -> None:
     # Should have routed to the chat target, not the non-chat one
     assert captured_model == ["chat-model"], f"expected chat-model, got {captured_model}"
     store.close()
+
+
+def test_streaming_meta_event_injected(tmp_path: Path, monkeypatch) -> None:
+    """Streaming response includes a meta event before the first data chunk."""
+    target = TargetConfig(
+        "local", "Local", "http://unused/v1", "local-model", local=True, probe=False
+    )
+    config = AppConfig(
+        host="127.0.0.1", port=18086, database=tmp_path / "app.db",
+        routing=RoutingConfig(),
+        targets=(target,),
+    )
+
+    async def stream_complete(self, payload, context, session_id):
+        from damselfish.router import CompletionResult
+        chunks = [
+            {"id": "x", "object": "chat.completion.chunk", "created": 1,
+             "model": "local-model",
+             "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]},
+        ]
+        for chunk in chunks:
+            yield chunk
+        self._stream_result = CompletionResult(
+            body={"choices": [{"message": {"content": "ok"}}]},
+            target=target, latency_ms=42.5,
+        )
+
+    monkeypatch.setattr(ModelRouter, "stream_complete", stream_complete)
+
+    app = create_app(config)
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "damselfish/auto",
+                "stream": True,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+    assert response.status_code == 200
+    body = response.text
+    assert "event: meta" in body
+    assert "latency_ms" in body
+    assert "target" in body
+    assert "local-model" in body
+
+
+def test_health_endpoint_deep_check(tmp_path: Path) -> None:
+    """Enhanced /health reports available_targets, healthy_targets, total_targets."""
+    target = TargetConfig(
+        "local", "Local", "http://unused/v1", "local-model", local=True, probe=False
+    )
+    config = AppConfig(
+        host="127.0.0.1", port=18086, database=tmp_path / "app.db",
+        routing=RoutingConfig(),
+        targets=(target,),
+    )
+    app = create_app(config)
+    with TestClient(app) as client:
+        response = client.get("/health")
+    assert response.status_code == 200
+    data = response.json()
+    assert "available_targets" in data
+    assert "healthy_targets" in data
+    assert "total_targets" in data
+    assert data["total_targets"] >= 1

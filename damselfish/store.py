@@ -172,8 +172,15 @@ class Store:
         return {row["target_id"]: _target_stats_from_row(row) for row in rows}
 
     def record_success(
-        self, target_id: str, latency_ms: float, alpha: float, probe: bool = False
+        self, target_id: str, latency_ms: float, alpha: float, probe: bool = False,
+        prompt_tokens: int = 0, completion_tokens: int = 0, total_tokens: int = 0,
     ) -> None:
+        """Record a successful request, optionally with token usage.
+
+        Combines what used to be three separate writes (record_success,
+        record_usage, record_cap) into a single UPDATE to reduce SQLite
+        lock contention under concurrent load.
+        """
         now = time.time()
         with self._lock, self._connection:
             row = self._connection.execute(
@@ -189,10 +196,18 @@ class Store:
                     consecutive_failures = 0, ewma_latency_ms = ?,
                     last_latency_ms = ?, last_success_at = ?,
                     last_probe_at = CASE WHEN ? THEN ? ELSE last_probe_at END,
-                    circuit_open_until = 0, last_error = NULL
+                    circuit_open_until = 0, last_error = NULL,
+                    prompt_tokens = prompt_tokens + ?,
+                    completion_tokens = completion_tokens + ?,
+                    total_tokens = total_tokens + ?
                 WHERE target_id = ?
                 """,
-                (0 if probe else 1, 0 if probe else 1, ewma, latency_ms, now, probe, now, target_id),
+                (
+                    0 if probe else 1, 0 if probe else 1,
+                    ewma, latency_ms, now, probe, now,
+                    prompt_tokens, completion_tokens, total_tokens,
+                    target_id,
+                ),
             )
 
     def record_failure(
@@ -246,9 +261,8 @@ class Store:
     ) -> None:
         """Accumulate token usage from upstream ``usage`` fields.
 
-        Called after a successful completion (streaming or non-streaming)
-        when the upstream response includes a ``usage`` object.  Values are
-        accumulated per-target so the stats endpoint can report totals.
+        Used for streaming responses where usage arrives in a later chunk
+        after ``record_success`` has already been called for the first chunk.
         """
         if not (prompt_tokens or completion_tokens or total_tokens):
             return

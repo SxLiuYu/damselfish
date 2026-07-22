@@ -34,16 +34,18 @@ def infer_context(
     scenario: str | None = None,
     persona: str | None = None,
 ) -> RouteContext:
-    text = "\n".join(
-        str(message.get("content", ""))
-        for message in messages[-6:]
-        if isinstance(message.get("content"), str)
-    ).lower()
-    system_text = "\n".join(
-        str(message.get("content", ""))
-        for message in messages
-        if message.get("role") == "system"
-    ).lower()
+    # Only join the last 6 messages and only string content for efficiency
+    text_parts: list[str] = []
+    for message in messages[-6:]:
+        content = message.get("content")
+        if isinstance(content, str):
+            text_parts.append(content)
+    text = "".join(text_parts).lower()
+    system_parts: list[str] = []
+    for message in messages:
+        if message.get("role") == "system" and isinstance(message.get("content"), str):
+            system_parts.append(message["content"])
+    system_text = "".join(system_parts).lower()
 
     selected_persona = persona.lower() if persona else None
     if not selected_persona:
@@ -109,6 +111,10 @@ def rank_targets(
         attempts = state.successes + state.failures
         failure_rate = state.failures / attempts if attempts else 0.0
         score = latency + failure_rate * config.routing.failure_penalty_ms
+        # Dynamic penalty: when failure rate > 50%, add exponential penalty
+        # so chronically failing targets sink to the bottom of the ranking.
+        if failure_rate > 0.5 and attempts >= 5:
+            score += 10000.0 * (failure_rate - 0.5) * 2
         score += target.priority * config.routing.priority_weight_ms
         score -= len(context.preferred & target.capabilities) * 100.0
         if context.scenario in target.scenarios:

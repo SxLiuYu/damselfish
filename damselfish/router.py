@@ -5,6 +5,7 @@ import json
 import logging
 import random
 import time
+from collections import OrderedDict
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
@@ -17,6 +18,10 @@ from .store import Store
 from .tokens import estimate_text_tokens, estimate_messages_tokens
 
 log = logging.getLogger("damselfish.router")
+
+# Maximum number of cached responses and TTL in seconds.
+_CACHE_MAX = 128
+_CACHE_TTL = 30.0
 
 
 @dataclass(slots=True)
@@ -49,6 +54,9 @@ class ModelRouter:
             for target in config.targets
         }
         self._raced_ids: set[str] = set()
+        # Short-lived in-memory cache for identical requests (dedup).
+        # Keyed by hashed payload, value is a CompletionResult.
+        self._cache: OrderedDict[str, CompletionResult] = OrderedDict()
 
     def reconfigure(self, config: AppConfig) -> None:
         self.config = config
@@ -58,6 +66,40 @@ class ModelRouter:
             )
             for target in config.targets
         }
+        self._cache.clear()
+
+    @staticmethod
+    def _cache_key(payload: dict[str, Any]) -> str:
+        """Build a hash key from the request payload for dedup."""
+        import hashlib
+        # Only hash the fields that affect the upstream response.
+        relevant = {
+            k: v for k, v in payload.items()
+            if k in ("messages", "tools", "tool_choice", "temperature", "top_p",
+                     "max_tokens", "max_completion_tokens", "stop", "response_format",
+                     "seed", "presence_penalty", "frequency_penalty", "n", "user")
+        }
+        raw = json.dumps(relevant, sort_keys=True, ensure_ascii=False)
+        return hashlib.sha256(raw.encode()).hexdigest()
+
+    def _cache_get(self, payload: dict[str, Any]) -> CompletionResult | None:
+        key = self._cache_key(payload)
+        entry = self._cache.get(key)
+        if entry is None:
+            return None
+        result, ts = entry
+        if time.time() - ts > _CACHE_TTL:
+            self._cache.pop(key, None)
+            return None
+        self._cache.move_to_end(key)
+        return result
+
+    def _cache_put(self, payload: dict[str, Any], result: CompletionResult) -> None:
+        key = self._cache_key(payload)
+        self._cache[key] = (result, time.time())
+        self._cache.move_to_end(key)
+        while len(self._cache) > _CACHE_MAX:
+            self._cache.popitem(last=False)
 
     async def complete(
         self,
@@ -65,6 +107,12 @@ class ModelRouter:
         context: RouteContext,
         session_id: str | None,
     ) -> CompletionResult:
+        # Short-lived cache hit for identical requests (dedup within 30s).
+        cached = self._cache_get(payload)
+        if cached is not None:
+            log.info("cache hit for %s, returning cached result", context.scenario)
+            return cached
+
         targets = rank_targets(
             self.config,
             context,
@@ -113,6 +161,7 @@ class ModelRouter:
             "route scenario=%s persona=%s target=%s latency_ms=%.1f",
             context.scenario, context.persona or "-", result.target.id, result.latency_ms,
         )
+        self._cache_put(payload, result)
         return result
 
     async def stream_complete(
@@ -409,19 +458,13 @@ class ModelRouter:
             failure = UpstreamFailure(target, 502, f"invalid upstream response: {error}")
             self._record_failure(target, failure.status, str(failure), probe)
             raise failure from error
+        usage = body.get("usage") if not probe else None
         self.store.record_success(
-            target.id, latency_ms, self.config.routing.ewma_alpha, probe
+            target.id, latency_ms, self.config.routing.ewma_alpha, probe,
+            prompt_tokens=int(usage.get("prompt_tokens", 0) or 0) if isinstance(usage, dict) else 0,
+            completion_tokens=int(usage.get("completion_tokens", 0) or 0) if isinstance(usage, dict) else 0,
+            total_tokens=int(usage.get("total_tokens", 0) or 0) if isinstance(usage, dict) else 0,
         )
-        # Capture upstream token usage (if provided)
-        if not probe:
-            usage = body.get("usage")
-            if isinstance(usage, dict):
-                self.store.record_usage(
-                    target.id,
-                    prompt_tokens=int(usage.get("prompt_tokens", 0) or 0),
-                    completion_tokens=int(usage.get("completion_tokens", 0) or 0),
-                    total_tokens=int(usage.get("total_tokens", 0) or 0),
-                )
         body["model"] = target.model
         return CompletionResult(body=body, target=target, latency_ms=latency_ms)
 
@@ -461,21 +504,15 @@ class ModelRouter:
                 if not isinstance(body, dict) or not isinstance(body.get("choices"), list):
                     raise ValueError("non-streaming upstream response has no choices")
                 normalized = _normalize_stream_chunk(body, target.model)
+                usage = body.get("usage") if not probe else None
                 self.store.record_success(
-                    target.id, latency_ms, self.config.routing.ewma_alpha, probe
+                    target.id, latency_ms, self.config.routing.ewma_alpha, probe,
+                    prompt_tokens=int(usage.get("prompt_tokens", 0) or 0) if isinstance(usage, dict) else 0,
+                    completion_tokens=int(usage.get("completion_tokens", 0) or 0) if isinstance(usage, dict) else 0,
+                    total_tokens=int(usage.get("total_tokens", 0) or 0) if isinstance(usage, dict) else 0,
                 )
                 _first_yielded = True
                 yield normalized
-                # Capture usage from non-streaming JSON body
-                if not probe:
-                    usage = body.get("usage")
-                    if isinstance(usage, dict):
-                        self.store.record_usage(
-                            target.id,
-                            prompt_tokens=int(usage.get("prompt_tokens", 0) or 0),
-                            completion_tokens=int(usage.get("completion_tokens", 0) or 0),
-                            total_tokens=int(usage.get("total_tokens", 0) or 0),
-                        )
                 return
             async for line in response.aiter_lines():
                 line = line.strip()
@@ -489,21 +526,23 @@ class ModelRouter:
                 except json.JSONDecodeError:
                     continue
                 normalized = _normalize_stream_chunk(chunk, target.model)
+                usage = chunk.get("usage") if not probe else None
                 if not _first_yielded:
                     _first_yielded = True
                     self.store.record_success(
-                        target.id, latency_ms, self.config.routing.ewma_alpha, probe
+                        target.id, latency_ms, self.config.routing.ewma_alpha, probe,
+                        prompt_tokens=int(usage.get("prompt_tokens", 0) or 0) if isinstance(usage, dict) else 0,
+                        completion_tokens=int(usage.get("completion_tokens", 0) or 0) if isinstance(usage, dict) else 0,
+                        total_tokens=int(usage.get("total_tokens", 0) or 0) if isinstance(usage, dict) else 0,
                     )
-                # Capture usage from last chunk (some providers send it)
-                if not probe:
-                    usage = chunk.get("usage")
-                    if isinstance(usage, dict):
-                        self.store.record_usage(
-                            target.id,
-                            prompt_tokens=int(usage.get("prompt_tokens", 0) or 0),
-                            completion_tokens=int(usage.get("completion_tokens", 0) or 0),
-                            total_tokens=int(usage.get("total_tokens", 0) or 0),
-                        )
+                elif isinstance(usage, dict):
+                    # Subsequent chunk with usage (some providers send it on the last chunk)
+                    self.store.record_usage(
+                        target.id,
+                        prompt_tokens=int(usage.get("prompt_tokens", 0) or 0),
+                        completion_tokens=int(usage.get("completion_tokens", 0) or 0),
+                        total_tokens=int(usage.get("total_tokens", 0) or 0),
+                    )
                 yield normalized
         except UpstreamFailure as error:
             if not _first_yielded:

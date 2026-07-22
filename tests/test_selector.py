@@ -211,3 +211,32 @@ def test_rank_targets_max_new_tokens_parameter(tmp_path: Path) -> None:
     ranked2 = rank_targets(app_config, context, store.all_stats(), max_new_tokens=500)
     assert {t.id for t in ranked2} == {"small", "big"}
     store.close()
+
+
+def test_rank_dynamic_penalty_for_high_failure_rate(tmp_path: Path) -> None:
+    """Targets with >50% failure rate get an extra penalty."""
+    app_config = AppConfig(
+        host="127.0.0.1", port=8086, database=tmp_path / "test.db",
+        routing=RoutingConfig(priority_weight_ms=0, failure_penalty_ms=2000),
+        targets=(
+            TargetConfig("reliable", "Reliable", "http://r/v1", "r", local=True,
+                         priority=1, capabilities=frozenset({"chat"})),
+            TargetConfig("flaky", "Flaky", "http://f/v1", "f", local=True,
+                         priority=2, capabilities=frozenset({"chat"})),
+        ),
+    )
+    store = Store(app_config.database, ["reliable", "flaky"])
+    # Reliable: 100 successes, 0 failures
+    for _ in range(100):
+        store.record_success("reliable", 100, 0.5)
+    # Flaky: 10 successes, 90 failures (90% failure rate)
+    for _ in range(10):
+        store.record_success("flaky", 100, 0.5)
+    for _ in range(90):
+        store.record_failure("flaky", 500, "error", 0)
+
+    context = RouteContext("default", None, frozenset({"chat"}), frozenset(), ())
+    ranked = rank_targets(app_config, context, store.all_stats())
+    # Reliable should be ranked first despite equal latency
+    assert ranked[0].id == "reliable"
+    store.close()

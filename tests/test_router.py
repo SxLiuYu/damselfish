@@ -994,3 +994,127 @@ def test_router_no_usage_does_not_break(tmp_path: Path) -> None:
     assert stats.completion_tokens == 0
     assert stats.total_tokens == 0
     store.close()
+
+
+# ── response cache tests ────────────────────────────────────────────
+
+
+def test_router_cache_hit_returns_same_result(tmp_path: Path) -> None:
+    """Identical requests within TTL return cached result."""
+    config = AppConfig(
+        host="127.0.0.1", port=8086, database=tmp_path / "test.db",
+        routing=RoutingConfig(priority_weight_ms=1),
+        targets=(
+            TargetConfig("t1", "T1", "http://router/v1", "m",
+                         local=True, priority=1),
+        ),
+    )
+    store = Store(config.database, ["t1"])
+
+    call_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        return httpx.Response(
+            200,
+            json={
+                "id": f"ok-{call_count}",
+                "choices": [{"message": {"role": "assistant", "content": f"response {call_count}"}, "finish_reason": "stop"}],
+            },
+        )
+
+    async def run() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            router = ModelRouter(config, store, client)
+            payload = {"model": "auto", "messages": [{"role": "user", "content": "hi"}]}
+            ctx = RouteContext("default", None, frozenset(), frozenset(), ())
+            # First call hits upstream
+            r1 = await router.complete(payload, ctx, "test")
+            # Second call should hit cache
+            r2 = await router.complete(payload, ctx, "test")
+            assert r1.body["id"] == r2.body["id"]
+            assert call_count == 1
+
+    asyncio.run(run())
+    store.close()
+
+
+def test_router_cache_misses_different_payload(tmp_path: Path) -> None:
+    """Different payloads bypass the cache."""
+    config = AppConfig(
+        host="127.0.0.1", port=8086, database=tmp_path / "test.db",
+        routing=RoutingConfig(priority_weight_ms=1),
+        targets=(
+            TargetConfig("t1", "T1", "http://router/v1", "m",
+                         local=True, priority=1),
+        ),
+    )
+    store = Store(config.database, ["t1"])
+
+    call_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        return httpx.Response(
+            200,
+            json={
+                "id": f"ok-{call_count}",
+                "choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+            },
+        )
+
+    async def run() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            router = ModelRouter(config, store, client)
+            ctx = RouteContext("default", None, frozenset(), frozenset(), ())
+            await router.complete(
+                {"model": "auto", "messages": [{"role": "user", "content": "hi"}]}, ctx, "t1",
+            )
+            await router.complete(
+                {"model": "auto", "messages": [{"role": "user", "content": "bye"}]}, ctx, "t2",
+            )
+            assert call_count == 2
+
+    asyncio.run(run())
+    store.close()
+
+
+def test_router_cache_cleared_on_reconfigure(tmp_path: Path) -> None:
+    """Router reconfiguration clears the cache."""
+    config = AppConfig(
+        host="127.0.0.1", port=8086, database=tmp_path / "test.db",
+        routing=RoutingConfig(priority_weight_ms=1),
+        targets=(
+            TargetConfig("t1", "T1", "http://router/v1", "m",
+                         local=True, priority=1),
+        ),
+    )
+    store = Store(config.database, ["t1"])
+
+    call_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        return httpx.Response(
+            200,
+            json={
+                "id": f"ok-{call_count}",
+                "choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+            },
+        )
+
+    async def run() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            router = ModelRouter(config, store, client)
+            payload = {"model": "auto", "messages": [{"role": "user", "content": "hi"}]}
+            ctx = RouteContext("default", None, frozenset(), frozenset(), ())
+            await router.complete(payload, ctx, "t1")
+            router.reconfigure(config)  # clears cache
+            await router.complete(payload, ctx, "t1")
+            assert call_count == 2
+
+    asyncio.run(run())
+    store.close()
