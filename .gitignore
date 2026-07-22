@@ -15,3 +15,22 @@ dist/
 *.sqlite3
 managed-nodes.json
 data/
+
+# Temp/debug artifacts
+*.crt
+*.bundle
+*.tar
+.codex-remote-patch/
+remote_*.txt
+local_manifest*.txt
+acceptance_baseline.txt
+acc_body.json
+pscp_test_remote.txt
+git_tree_manifest.txt
+local_sha256_manifest.txt
+print_stats.py
+adjust_priority.py
+damselfish-http.conf
+remote_acc_test.sh
+remote_manifest_gen.py
+local_manifest_gen.py
