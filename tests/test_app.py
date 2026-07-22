@@ -253,3 +253,140 @@ def test_auto_fallback_to_longer_context_on_overflow(tmp_path: Path) -> None:
     assert response.status_code == 200
     assert response.headers["X-Damselfish-Target"] == "long"
     assert response.json()["choices"][0]["message"]["content"] == "from long"
+
+
+# ── _compress_conversation tests ────────────────────────────────────
+
+
+def test_compress_conversation_removes_hardcoded_target(tmp_path: Path) -> None:
+    """Compression uses auto-routing, not hardcoded deepseek-v4-flash."""
+    from damselfish.app import _compress_conversation
+    from damselfish.store import Store
+    from damselfish.router import ModelRouter
+
+    target = TargetConfig(
+        "fast", "Fast", "http://router/v1", "fast-model",
+        local=True, priority=1, probe=False,
+    )
+    config = AppConfig(
+        host="127.0.0.1", port=8086, database=tmp_path / "test.db",
+        routing=RoutingConfig(priority_weight_ms=1),
+        targets=(target,),
+    )
+    store = Store(config.database, ["fast"])
+
+    # Build a long conversation that would trigger compression
+    messages = [{"role": "user", "content": f"msg {i}"} for i in range(35)]
+    messages.append({"role": "assistant", "content": "ok"})
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = __import__("json").loads(request.content)
+        content = payload["messages"][0]["content"]
+        # Verify it's a Chinese summary prompt, not hardcoded target
+        assert "对话" in content or "summarize" in content.lower()
+        return httpx.Response(
+            200,
+            json={"id": "ok", "choices": [{"message": {"role": "assistant", "content": "用户讨论了多个技术问题"}, "finish_reason": "stop"}]},
+        )
+
+    async def run() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            router = ModelRouter(config, store, client)
+            await _compress_conversation(store, router, "test-session", messages, 10)
+            # Verify messages were compressed
+            saved = store.get_session("test-session", ttl_days=30)
+            assert saved is not None
+            assert len(saved) < len(messages)
+
+    asyncio.run(run())
+    store.close()
+
+
+def test_compress_conversation_skips_when_no_reduction(tmp_path: Path) -> None:
+    """Compression is skipped if token count doesn't decrease."""
+    from damselfish.app import _compress_conversation
+    from damselfish.store import Store
+    from damselfish.router import ModelRouter
+
+    target = TargetConfig(
+        "fast", "Fast", "http://router/v1", "fast-model",
+        local=True, priority=1, probe=False,
+    )
+    config = AppConfig(
+        host="127.0.0.1", port=8086, database=tmp_path / "test.db",
+        routing=RoutingConfig(priority_weight_ms=1),
+        targets=(target,),
+    )
+    store = Store(config.database, ["fast"])
+
+    # Short conversation — should not compress
+    messages = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "hello"},
+    ]
+
+    call_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        return httpx.Response(
+            200,
+            json={"id": "ok", "choices": [{"message": {"role": "assistant", "content": "summary"}, "finish_reason": "stop"}]},
+        )
+
+    async def run() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            router = ModelRouter(config, store, client)
+            await _compress_conversation(store, router, "short-session", messages, 10)
+
+    asyncio.run(run())
+    # Should not have called the LLM (too short to compress)
+    assert call_count == 0
+    store.close()
+
+
+def test_compress_conversation_uses_chinese_prompt(tmp_path: Path) -> None:
+    """Compression prompt is in Chinese, not English."""
+    from damselfish.app import _compress_conversation
+    from damselfish.store import Store
+    from damselfish.router import ModelRouter
+
+    target = TargetConfig(
+        "fast", "Fast", "http://router/v1", "fast-model",
+        local=True, priority=1, probe=False,
+    )
+    config = AppConfig(
+        host="127.0.0.1", port=8086, database=tmp_path / "test.db",
+        routing=RoutingConfig(priority_weight_ms=1),
+        targets=(target,),
+    )
+    store = Store(config.database, ["fast"])
+
+    messages = [{"role": "user", "content": f"问题 {i}"} for i in range(35)]
+    messages.append({"role": "assistant", "content": "回答"})
+
+    captured_prompt = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = __import__("json").loads(request.content)
+        captured_prompt.append(payload["messages"][0]["content"])
+        return httpx.Response(
+            200,
+            json={"id": "ok", "choices": [{"message": {"role": "assistant", "content": "摘要"}, "finish_reason": "stop"}]},
+        )
+
+    async def run() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            router = ModelRouter(config, store, client)
+            await _compress_conversation(store, router, "cn-session", messages, 10)
+
+    asyncio.run(run())
+    assert len(captured_prompt) == 1
+    prompt = captured_prompt[0]
+    # Verify Chinese prompt (check for Chinese characters)
+    assert any('\u4e00' <= c <= '\u9fff' for c in prompt)
+    # Verify it's a summary prompt, not English
+    assert "summarize" not in prompt.lower()
+    assert "Please" not in prompt
+    store.close()

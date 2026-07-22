@@ -414,7 +414,13 @@ def create_app(config: AppConfig | None = None, config_path: str | Path | None =
 
 
 async def _compress_conversation(store, router, session_id, messages, keep):
-    """Compress old conversation messages using a lightweight model."""
+    """Compress old conversation messages using a lightweight model.
+
+    Fixes:
+    - Removed hardcoded preferred_targets (deepseek-v4-flash didn't exist on server)
+    - Now uses auto-routing with "fast" preference
+    - Verifies compression actually reduced token count
+    """
     if not session_id or len(messages) <= keep + 5:
         return
     try:
@@ -427,15 +433,16 @@ async def _compress_conversation(store, router, session_id, messages, keep):
         if not text.strip():
             return
         prompt = (
-            "Please summarize the following conversation briefly in Chinese. "
-            "Cover user needs, resolved issues, and key decisions. "
-            "Keep enough detail for continuity. Max 200 chars.\n\n" + text
+            "请用中文简要总结以下对话。\n"
+            "涵盖用户需求、已解决的问题和关键决策。\n"
+            "保留足够细节以保持对话连续性。最多 200 字。\n\n" + text
         )
-        from .selector import RouteContext
+        from .selector import RouteContext, _estimate_messages_tokens
+        # Use auto-routing with "fast" preference instead of hardcoded target
         ctx = RouteContext(
             scenario="default", persona=None,
             required=frozenset(), preferred=frozenset({"fast"}),
-            preferred_targets=("deepseek-v4-flash",),
+            preferred_targets=(),
         )
         payload = {
             "messages": [{"role": "user", "content": prompt}],
@@ -446,11 +453,18 @@ async def _compress_conversation(store, router, session_id, messages, keep):
         if not summary:
             return
         compressed = [
-            {"role": "system", "content": "Conversation summary: " + summary}
+            {"role": "system", "content": "对话摘要：" + summary}
         ] + recent
+        # Verify compression actually reduced token count
+        old_tokens = _estimate_messages_tokens(messages)
+        new_tokens = _estimate_messages_tokens(compressed)
+        if new_tokens >= old_tokens:
+            log.info("compression skipped for %s: tokens %d -> %d (no reduction)",
+                     session_id[:8], old_tokens, new_tokens)
+            return
         store.update_session_messages(session_id, compressed)
-        log.info("compressed session %s: %d -> %d messages",
-                 session_id[:8], len(messages), len(compressed))
+        log.info("compressed session %s: %d -> %d messages, tokens %d -> %d",
+                 session_id[:8], len(messages), len(compressed), old_tokens, new_tokens)
     except Exception as e:
         log.warning("compression failed for %s: %s", session_id[:8], e)
 
