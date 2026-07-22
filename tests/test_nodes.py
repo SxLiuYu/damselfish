@@ -311,3 +311,74 @@ def test_node_model_discovery_failure_does_not_break_node_list(
     assert models.json()["status"] == 404
     assert listed.status_code == 200
     assert any(item["id"] == "free-cloud" for item in listed.json()["data"])
+
+
+# ── max_context in node management ───────────────────────────────────
+
+
+def test_node_create_with_max_context(tmp_path: Path, monkeypatch) -> None:
+    """Creating a node with max_context persists the value."""
+    monkeypatch.setenv("DAMSELFISH_API_KEY", "service-secret")
+    headers = {"Authorization": "Bearer service-secret"}
+    app = create_app(config(tmp_path))
+    with TestClient(app) as client:
+        payload = {
+            **node_payload(),
+            "max_context": 16384,
+        }
+        response = client.post("/admin/api/nodes", headers=headers, json=payload)
+        assert response.status_code == 201
+        data = response.json()["data"]
+        assert data["max_context"] == 16384
+        # Also verify it's persisted to disk
+        saved = json.loads((tmp_path / "managed-nodes.json").read_text())
+        node = next(n for n in saved["nodes"] if n["id"] == "free-cloud")
+        assert node["max_context"] == 16384
+
+
+def test_node_public_exposes_max_context(tmp_path: Path, monkeypatch) -> None:
+    """max_context is exposed in the public API."""
+    monkeypatch.setenv("DAMSELFISH_API_KEY", "service-secret")
+    headers = {"Authorization": "Bearer service-secret"}
+    app = create_app(config(tmp_path))
+    with TestClient(app) as client:
+        payload = {**node_payload(), "max_context": 32000}
+        client.post("/admin/api/nodes", headers=headers, json=payload)
+        listed = client.get("/admin/api/nodes", headers=headers).json()["data"]
+        node = next(n for n in listed if n["id"] == "free-cloud")
+        assert node["max_context"] == 32000
+
+
+def test_node_update_preserves_max_context(tmp_path: Path, monkeypatch) -> None:
+    """Updating a node preserves max_context."""
+    monkeypatch.setenv("DAMSELFISH_API_KEY", "service-secret")
+    headers = {"Authorization": "Bearer service-secret"}
+    app = create_app(config(tmp_path))
+    with TestClient(app) as client:
+        payload = {**node_payload(), "max_context": 16384}
+        client.post("/admin/api/nodes", headers=headers, json=payload)
+        # Update: change label, omit max_context
+        update = {
+            "id": "free-cloud",
+            "label": "Updated Cloud",
+            "base_url": "https://free.example/v1",
+            "model": "free-model",
+            "api_key": "",
+        }
+        response = client.put("/admin/api/nodes/free-cloud", headers=headers, json=update)
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["label"] == "Updated Cloud"
+        assert data["max_context"] == 16384
+
+
+def test_node_create_without_max_context_defaults_to_none(tmp_path: Path, monkeypatch) -> None:
+    """Creating a node without max_context defaults to None/null."""
+    monkeypatch.setenv("DAMSELFISH_API_KEY", "service-secret")
+    headers = {"Authorization": "Bearer service-secret"}
+    app = create_app(config(tmp_path))
+    with TestClient(app) as client:
+        response = client.post("/admin/api/nodes", headers=headers, json=node_payload())
+        assert response.status_code == 201
+        data = response.json()["data"]
+        assert data["max_context"] is None

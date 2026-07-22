@@ -96,6 +96,10 @@ def normalize_node(
     api_key = str(payload.get("api_key", "")).strip()
     if not api_key and existing:
         api_key = str(existing.get("api_key", ""))
+    # Preserve max_context from existing when not provided in payload
+    max_context_raw = payload.get("max_context")
+    if max_context_raw is None and existing and existing.get("max_context") is not None:
+        max_context_raw = existing.get("max_context")
     capabilities = _string_list(payload.get("capabilities", ["chat"]), "能力")
     unknown = set(capabilities) - _ALLOWED_CAPABILITIES
     if unknown:
@@ -120,7 +124,7 @@ def normalize_node(
         "max_concurrency": _bounded_int(
             payload.get("max_concurrency", 4), "最大并发", 1, 100
         ),
-        "max_context": _optional_int(payload.get("max_context"), "上下文上限"),
+        "max_context": _optional_int(max_context_raw, "上下文上限"),
     }
 
 

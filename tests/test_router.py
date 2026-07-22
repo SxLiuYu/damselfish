@@ -5,7 +5,15 @@ import httpx
 import pytest
 
 from damselfish.config import AppConfig, RoutingConfig, TargetConfig
-from damselfish.router import ModelRouter, UpstreamFailure
+from damselfish.router import (
+    ModelRouter,
+    UpstreamFailure,
+    _estimate_current_input_tokens,
+    _estimate_text_tokens,
+    _is_context_overflow,
+    _max_new_tokens,
+    _upstream_payload,
+)
 from damselfish.selector import RouteContext
 from damselfish.store import Store
 
@@ -514,6 +522,296 @@ def test_stream_complete_phase2_all_fail_falls_to_serial(tmp_path: Path) -> None
         assert len(chunks) >= 1
         assert router._stream_result is not None
         assert router._stream_result.target.id == "winner"
+
+    asyncio.run(run())
+    store.close()
+
+
+# ── _max_new_tokens tests ────────────────────────────────────────────
+
+
+def test_max_new_tokens_default() -> None:
+    """Default max_new_tokens is 1024."""
+    assert _max_new_tokens({}) == 1024
+    assert _max_new_tokens({"messages": []}) == 1024
+
+
+def test_max_new_tokens_from_payload() -> None:
+    """Extracts max_tokens from payload."""
+    assert _max_new_tokens({"max_tokens": 2048}) == 2048
+
+
+def test_max_new_tokens_from_max_completion_tokens() -> None:
+    """Falls back to max_completion_tokens."""
+    assert _max_new_tokens({"max_completion_tokens": 4096}) == 4096
+
+
+def test_max_new_tokens_prefers_max_tokens() -> None:
+    """max_tokens beats max_completion_tokens."""
+    assert _max_new_tokens({"max_tokens": 512, "max_completion_tokens": 1024}) == 512
+
+
+# ── _estimate_text_tokens / _estimate_current_input_tokens tests ─────────────
+
+
+def test_router_estimate_text_tokens_cjk() -> None:
+    """CJK text estimated correctly."""
+    assert _estimate_text_tokens("中" * 1000) == 1650
+
+
+def test_router_estimate_text_tokens_ascii() -> None:
+    """ASCII text estimated correctly."""
+    assert _estimate_text_tokens("hello world " * 100) == 330
+
+
+def test_router_estimate_current_input_tokens() -> None:
+    """Estimate input tokens from messages list."""
+    messages = [
+        {"role": "user", "content": "中" * 100},
+        {"role": "assistant", "content": "hello"},
+    ]
+    estimated = _estimate_current_input_tokens(messages)
+    assert estimated > 0
+
+
+# ── _is_context_overflow tests ───────────────────────────────────────
+
+
+def test_is_context_overflow_detects_zhipu_error() -> None:
+    """Detects Zhipu-style context overflow error."""
+    error = UpstreamFailure(
+        TargetConfig("test", "Test", "http://t/v1", "t"),
+        400,
+        "Input validation error: `inputs` tokens + `max_new_tokens` must be <= 16384",
+    )
+    assert _is_context_overflow(error) is True
+
+
+def test_is_context_overflow_detects_maximum_context() -> None:
+    """Detects 'maximum context length' error."""
+    error = UpstreamFailure(
+        TargetConfig("test", "Test", "http://t/v1", "t"),
+        400,
+        "This model's maximum context length is 4096 tokens",
+    )
+    assert _is_context_overflow(error) is True
+
+
+def test_is_context_overflow_detects_too_long() -> None:
+    """Detects 'too long' error."""
+    error = UpstreamFailure(
+        TargetConfig("test", "Test", "http://t/v1", "t"),
+        400,
+        "text is too long for the model",
+    )
+    assert _is_context_overflow(error) is True
+
+
+def test_is_context_overflow_rejects_429() -> None:
+    """429 errors are not context overflow."""
+    error = UpstreamFailure(
+        TargetConfig("test", "Test", "http://t/v1", "t"),
+        429,
+        "rate limited",
+    )
+    assert _is_context_overflow(error) is False
+
+
+def test_is_context_overflow_rejects_other_400() -> None:
+    """Other 400 errors are not context overflow."""
+    error = UpstreamFailure(
+        TargetConfig("test", "Test", "http://t/v1", "t"),
+        400,
+        "invalid parameter: temperature must be between 0 and 2",
+    )
+    assert _is_context_overflow(error) is False
+
+
+# ── _upstream_payload capping tests ──────────────────────────────────
+
+
+def test_upstream_payload_caps_max_tokens() -> None:
+    """max_tokens is capped when input + max_tokens > max_context."""
+    target = TargetConfig(
+        "test", "Test", "http://t/v1", "t",
+        local=True, max_context=4096,
+    )
+    payload = {
+        "messages": [{"role": "user", "content": "中" * 2000}],
+        "max_tokens": 2048,
+    }
+    request = _upstream_payload(payload, target, probe=False)
+    assert request["max_tokens"] < 2048
+
+
+def test_upstream_payload_no_cap_within_limit() -> None:
+    """max_tokens is not capped when within max_context."""
+    target = TargetConfig(
+        "test", "Test", "http://t/v1", "t",
+        local=True, max_context=4096,
+    )
+    payload = {
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 500,
+    }
+    request = _upstream_payload(payload, target, probe=False)
+    assert request["max_tokens"] == 500
+
+
+def test_upstream_payload_no_max_context() -> None:
+    """Without max_context, no capping occurs."""
+    target = TargetConfig(
+        "test", "Test", "http://t/v1", "t",
+        local=True, max_context=None,
+    )
+    payload = {
+        "messages": [{"role": "user", "content": "中" * 50000}],
+        "max_tokens": 99999,
+    }
+    request = _upstream_payload(payload, target, probe=False)
+    assert request["max_tokens"] == 99999
+
+
+def test_upstream_payload_probe_skips_capping() -> None:
+    """Probe requests skip capping."""
+    target = TargetConfig(
+        "test", "Test", "http://t/v1", "t",
+        local=True, max_context=4096,
+    )
+    payload = {
+        "messages": [{"role": "user", "content": "中" * 5000}],
+        "max_tokens": 99999,
+    }
+    request = _upstream_payload(payload, target, probe=True)
+    assert "tools" not in request
+    assert request["max_tokens"] == 99999
+
+
+def test_upstream_payload_caps_max_completion_tokens() -> None:
+    """max_completion_tokens is also capped."""
+    target = TargetConfig(
+        "test", "Test", "http://t/v1", "t",
+        local=True, max_context=2048,
+    )
+    payload = {
+        "messages": [{"role": "user", "content": "中" * 1200}],
+        "max_completion_tokens": 2048,
+    }
+    request = _upstream_payload(payload, target, probe=False)
+    assert request["max_completion_tokens"] < 2048
+
+
+# ── Router fallback on context overflow 400 ─────────────────────────
+
+
+def test_router_falls_back_on_context_overflow_400(tmp_path: Path) -> None:
+    """Primary returns 400 context overflow; falls back to next target."""
+    config = AppConfig(
+        host="127.0.0.1", port=8086, database=tmp_path / "test.db",
+        routing=RoutingConfig(priority_weight_ms=1),
+        targets=(
+            TargetConfig("short", "Short", "http://router/v1", "short",
+                         local=True, priority=1),
+            TargetConfig("long", "Long", "http://router/v1", "long",
+                         local=True, priority=2),
+        ),
+    )
+    store = Store(config.database, ["short", "long"])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        model = __import__("json").loads(request.content)["model"]
+        if model == "short":
+            return httpx.Response(
+                400,
+                json={"error": {"message": "Input validation error: `inputs` tokens + `max_new_tokens` must be <= 16384"}},
+            )
+        return httpx.Response(200, json={"id": "ok", "choices": [{"message": {"role": "assistant", "content": "from long"}, "finish_reason": "stop"}]})
+
+    async def run() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            router = ModelRouter(config, store, client)
+            result = await router.complete(
+                {"model": "auto", "messages": [{"role": "user", "content": "hi"}]},
+                RouteContext("default", None, frozenset(), frozenset(), ()),
+                "test",
+            )
+            assert result.target.id == "long"
+            assert result.body["choices"][0]["message"]["content"] == "from long"
+
+    asyncio.run(run())
+    store.close()
+
+
+def test_router_does_not_fallback_on_other_400(tmp_path: Path) -> None:
+    """Non-context-overflow 400 does not trigger fallback."""
+    config = AppConfig(
+        host="127.0.0.1", port=8086, database=tmp_path / "test.db",
+        routing=RoutingConfig(priority_weight_ms=1),
+        targets=(
+            TargetConfig("primary", "Primary", "http://router/v1", "primary",
+                         local=True, priority=1),
+            TargetConfig("backup", "Backup", "http://router/v1", "backup",
+                         local=True, priority=2),
+        ),
+    )
+    store = Store(config.database, ["primary", "backup"])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, json={"error": {"message": "invalid parameter"}})
+
+    async def run() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            router = ModelRouter(config, store, client)
+            with pytest.raises(Exception) as exc:
+                await router.complete(
+                    {"model": "auto", "messages": [{"role": "user", "content": "hi"}]},
+                    RouteContext("default", None, frozenset(), frozenset(), ()),
+                    "test",
+                )
+            assert "NoTargetAvailable" in type(exc.value).__name__ or "primary target primary failed" in str(exc.value)
+
+    asyncio.run(run())
+    store.close()
+
+
+def test_stream_complete_phase1_400_context_overflow_fallback(tmp_path: Path) -> None:
+    """Stream: Phase 1 returns 400 context overflow; Phase 2 race succeeds."""
+    config = AppConfig(
+        host="127.0.0.1", port=8086, database=tmp_path / "test.db",
+        routing=RoutingConfig(priority_weight_ms=1, parallel_fallback_count=2, parallel_fallback_timeout_seconds=5.0),
+        targets=(
+            TargetConfig("short", "Short", "http://router/v1", "short",
+                         local=True, priority=1),
+            TargetConfig("long", "Long", "http://router/v1", "long",
+                         local=True, priority=2),
+        ),
+    )
+    store = Store(config.database, ["short", "long"])
+    sse_bytes = (
+        'data: {"id":"x","choices":[{"delta":{"content":"from long"},"finish_reason":null}]}\n\n'
+        'data: {"id":"x","choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+        'data: [DONE]\n\n'
+    ).encode()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        model = __import__("json").loads(request.content)["model"]
+        if model == "short":
+            return httpx.Response(400, json={"error": {"message": "`inputs` tokens + `max_new_tokens` must be <= 16384"}})
+        return httpx.Response(200, content=sse_bytes)
+
+    async def run() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            router = ModelRouter(config, store, client)
+            chunks = []
+            async for chunk in router.stream_complete(
+                {"model": "auto", "messages": [{"role": "user", "content": "hi"}]},
+                RouteContext("default", None, frozenset(), frozenset(), ()),
+                "test",
+            ):
+                chunks.append(chunk)
+            assert len(chunks) >= 1
+            assert router._stream_result is not None
+            assert router._stream_result.target.id == "long"
 
     asyncio.run(run())
     store.close()

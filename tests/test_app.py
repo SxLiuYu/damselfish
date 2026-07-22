@@ -207,3 +207,49 @@ def test_streaming_chat_completion_with_historical_stats_columns(
     assert response.headers["content-type"].startswith("text/event-stream")
     assert '"finish_reason": "stop"' in response.text
     assert "data: [DONE]" in response.text
+
+
+def test_auto_fallback_to_longer_context_on_overflow(tmp_path: Path) -> None:
+    """End-to-end: short-context target returns 400 overflow, router falls
+    back to a long-context target automatically."""
+    short_target = TargetConfig(
+        "short", "Short", "http://short/v1", "short",
+        local=True, priority=1, max_context=4096, probe=False,
+    )
+    long_target = TargetConfig(
+        "long", "Long", "http://long/v1", "long",
+        local=True, priority=2, max_context=128000, probe=False,
+    )
+    config = AppConfig(
+        host="127.0.0.1", port=18086, database=tmp_path / "app.db",
+        routing=RoutingConfig(priority_weight_ms=1),
+        targets=(short_target, long_target),
+    )
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        payload = __import__("json").loads(request.content)
+        model = payload["model"]
+        if model == "short":
+            return httpx.Response(
+                400,
+                json={"error": {"message": "`inputs` tokens + `max_new_tokens` must be <= 4096"}},
+            )
+        return httpx.Response(
+            200,
+            json={"id": "ok", "choices": [{"message": {"role": "assistant", "content": "from long"}, "finish_reason": "stop"}]},
+        )
+
+    app = create_app(config)
+    with TestClient(app) as client:
+        app.state.router.client = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "damselfish/auto",
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.headers["X-Damselfish-Target"] == "long"
+    assert response.json()["choices"][0]["message"]["content"] == "from long"
