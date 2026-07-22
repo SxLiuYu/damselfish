@@ -131,7 +131,7 @@ def rank_targets(
         # recent requests, add a small random penalty to avoid pinning all
         # traffic to a single target.  This only applies when the target has
         # enough history to be statistically meaningful.
-        if state.successes > 100 and state.failure_rate < 0.1:
+        if state.successes > 100 and failure_rate < 0.1:
             # Target is doing well — still give it a small chance of being
             # skipped so other targets get exercised.
             score += random.uniform(0, 50.0) if state.successes > 500 else 0.0
