@@ -42,6 +42,10 @@ def create_app(config: AppConfig | None = None, config_path: str | Path | None =
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         store = Store(loaded.database, [target.id for target in loaded.targets])
+        # Prune old decision rows to prevent unbounded table growth.
+        pruned = store.prune_decisions(keep=5000)
+        if pruned:
+            log.info("pruned %d old decision rows on startup", pruned)
         timeout = httpx.Timeout(
             loaded.routing.request_timeout_seconds,
             connect=loaded.routing.connect_timeout_seconds,
@@ -483,13 +487,13 @@ async def _compress_conversation(store, router, session_id, messages, keep):
         new_tokens = estimate_messages_tokens(compressed)
         if new_tokens >= old_tokens:
             log.info("compression skipped for %s: tokens %d -> %d (no reduction)",
-                     session_id[:8], old_tokens, new_tokens)
+                     _short_id(session_id), old_tokens, new_tokens)
             return
         store.update_session_messages(session_id, compressed)
         log.info("compressed session %s: %d -> %d messages, tokens %d -> %d",
-                 session_id[:8], len(messages), len(compressed), old_tokens, new_tokens)
+                 _short_id(session_id), len(messages), len(compressed), old_tokens, new_tokens)
     except Exception as e:
-        log.warning("compression failed for %s: %s", session_id[:8], e)
+        log.warning("compression failed for %s: %s", _short_id(session_id), e)
 
 async def _as_sse(body: dict[str, Any]) -> AsyncIterator[str]:
     choice = body["choices"][0]
@@ -635,6 +639,13 @@ def _identifier(value: Any, name: str, optional: bool = False) -> str | None:
     if len(normalized) > 200:
         raise HTTPException(status_code=400, detail=f"{name} is too long")
     return normalized
+
+
+def _short_id(session_id: str | None, length: int = 8) -> str:
+    """Truncate session_id for logging, safe for Unicode strings."""
+    if not session_id:
+        return "-"
+    return session_id[:length]
 
 
 def _title(value: Any) -> str | None:

@@ -310,6 +310,29 @@ class Store:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def prune_decisions(self, keep: int = 5000) -> int:
+        """Delete old decision rows, keeping at most ``keep`` most recent.
+
+        The decisions table grows with every request (including failures and
+        probes).  Without pruning it bloats the database and slows
+        ``recent_decisions``.  Call this periodically (e.g. on startup) to
+        cap the table size.
+        """
+        with self._lock, self._connection:
+            row = self._connection.execute(
+                "SELECT COUNT(*) AS count FROM decisions"
+            ).fetchone()
+            total = int(row["count"])
+            if total <= keep:
+                return 0
+            deleted = total - keep
+            self._connection.execute(
+                "DELETE FROM decisions WHERE id NOT IN "
+                "(SELECT id FROM decisions ORDER BY id DESC LIMIT ?)",
+                (keep,),
+            )
+            return deleted
+
     def get_session(self, session_id: str, ttl_days: int) -> list[dict[str, Any]]:
         return self.get_project_session("default", session_id, ttl_days)
 
@@ -422,14 +445,15 @@ class Store:
     ) -> None:
         with self._lock:
             serialized = json.dumps(messages, ensure_ascii=False)
+            now = time.time()
             self._connection.execute(
                 "UPDATE sessions SET messages_json = ?, updated_at = ? WHERE session_id = ?",
-                (serialized, time.time(), session_id),
+                (serialized, now, session_id),
             )
             self._connection.execute(
                 "UPDATE project_sessions SET messages_json = ?, updated_at = ?"
                 " WHERE session_id = ?",
-                (serialized, time.time(), session_id),
+                (serialized, now, session_id),
             )
 
     def list_projects(self) -> list[dict[str, Any]]:
@@ -599,12 +623,17 @@ def merge_messages(
         return list(incoming)
     if not incoming:
         return list(stored)
+    # Fast path: incoming starts with the entire stored history.
+    if len(incoming) >= len(stored) and incoming[: len(stored)] == stored:
+        return list(incoming)
+    # Find the largest overlap where the tail of stored matches the head of
+    # incoming.  Use length-based early exit to avoid O(n²) list comparisons.
     maximum = min(len(stored), len(incoming))
     for overlap in range(maximum, 0, -1):
         if stored[-overlap:] == incoming[:overlap]:
             return stored + incoming[overlap:]
-    if len(incoming) >= len(stored) and incoming[: len(stored)] == stored:
-        return list(incoming)
+    # No overlap: prepend system messages from incoming, then stored body, then
+    # the rest of incoming.
     system = [message for message in incoming if message.get("role") == "system"]
     body = [message for message in incoming if message.get("role") != "system"]
     stored_body = [message for message in stored if message.get("role") != "system"]
@@ -625,6 +654,9 @@ def project_context_message(
                 lines.append(f"{message.get('role', 'unknown')}: {content.strip()}")
     content = "\n".join(lines)
     if len(content) > max_chars:
+        # Truncate at a character boundary to avoid splitting multi-byte
+        # sequences.  Python strings are already Unicode code points, so
+        # slicing is safe; we just add an ellipsis indicator.
         content = content[-max_chars:]
         content = f"Damselfish shared memory for project {project_id} (truncated):\n{content}"
     return {"role": "system", "content": content}

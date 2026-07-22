@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import fcntl
 import json
 import os
 import re
@@ -17,6 +16,11 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None  # Windows fallback
 
 
 SYNC_TAG = "free-model-sync"
@@ -396,7 +400,8 @@ def main() -> int:
     lock_file = args.nodes_file.with_suffix(args.nodes_file.suffix + ".free-model-sync.lock")
     lock_file.parent.mkdir(parents=True, exist_ok=True)
     with lock_file.open("w") as lock_handle:
-        fcntl.flock(lock_handle, fcntl.LOCK_EX)
+        if fcntl is not None:
+            fcntl.flock(lock_handle, fcntl.LOCK_EX)
         original_stat = args.nodes_file.stat()
         payload = json.loads(args.nodes_file.read_text())
         nodes = payload.get("nodes")

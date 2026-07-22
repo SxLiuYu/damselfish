@@ -5,7 +5,6 @@ import json
 import logging
 import random
 import time
-from collections import OrderedDict
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
@@ -18,10 +17,6 @@ from .store import Store
 from .tokens import estimate_text_tokens, estimate_messages_tokens
 
 log = logging.getLogger("damselfish.router")
-
-# Maximum number of cached responses and TTL in seconds.
-_CACHE_MAX = 128
-_CACHE_TTL = 30.0
 
 
 @dataclass(slots=True)
@@ -54,9 +49,10 @@ class ModelRouter:
             for target in config.targets
         }
         self._raced_ids: set[str] = set()
-        # Short-lived in-memory cache for identical requests (dedup).
-        # Keyed by hashed payload, value is a CompletionResult.
-        self._cache: OrderedDict[str, CompletionResult] = OrderedDict()
+        # For stream race: store winner's iterator and first chunk so caller
+        # can continue streaming after the race succeeds.
+        self._race_winner_iterator: AsyncIterator[dict] | None = None
+        self._race_first_chunk: dict[str, Any] | None = None
 
     def reconfigure(self, config: AppConfig) -> None:
         self.config = config
@@ -66,40 +62,6 @@ class ModelRouter:
             )
             for target in config.targets
         }
-        self._cache.clear()
-
-    @staticmethod
-    def _cache_key(payload: dict[str, Any]) -> str:
-        """Build a hash key from the request payload for dedup."""
-        import hashlib
-        # Only hash the fields that affect the upstream response.
-        relevant = {
-            k: v for k, v in payload.items()
-            if k in ("messages", "tools", "tool_choice", "temperature", "top_p",
-                     "max_tokens", "max_completion_tokens", "stop", "response_format",
-                     "seed", "presence_penalty", "frequency_penalty", "n", "user")
-        }
-        raw = json.dumps(relevant, sort_keys=True, ensure_ascii=False)
-        return hashlib.sha256(raw.encode()).hexdigest()
-
-    def _cache_get(self, payload: dict[str, Any]) -> CompletionResult | None:
-        key = self._cache_key(payload)
-        entry = self._cache.get(key)
-        if entry is None:
-            return None
-        result, ts = entry
-        if time.time() - ts > _CACHE_TTL:
-            self._cache.pop(key, None)
-            return None
-        self._cache.move_to_end(key)
-        return result
-
-    def _cache_put(self, payload: dict[str, Any], result: CompletionResult) -> None:
-        key = self._cache_key(payload)
-        self._cache[key] = (result, time.time())
-        self._cache.move_to_end(key)
-        while len(self._cache) > _CACHE_MAX:
-            self._cache.popitem(last=False)
 
     async def complete(
         self,
@@ -107,12 +69,6 @@ class ModelRouter:
         context: RouteContext,
         session_id: str | None,
     ) -> CompletionResult:
-        # Short-lived cache hit for identical requests (dedup within 30s).
-        cached = self._cache_get(payload)
-        if cached is not None:
-            log.info("cache hit for %s, returning cached result", context.scenario)
-            return cached
-
         targets = rank_targets(
             self.config,
             context,
@@ -161,7 +117,6 @@ class ModelRouter:
             "route scenario=%s persona=%s target=%s latency_ms=%.1f",
             context.scenario, context.persona or "-", result.target.id, result.latency_ms,
         )
-        self._cache_put(payload, result)
         return result
 
     async def stream_complete(
@@ -212,17 +167,60 @@ class ModelRouter:
                 # Phase 3: serial fallback on leftovers
                 suffix = [t for t in targets[1:] if t.id not in self._raced_ids]
                 result = await self._serial_fallback(suffix, payload, context, session_id)
+                self._stream_result = result
+                self.store.record_decision(
+                    session_id, context.scenario, context.persona, result.target.id,
+                    result.latency_ms, True,
+                )
+                log.info(
+                    "route scenario=%s persona=%s target=%s latency_ms=%.1f (stream fallback)",
+                    context.scenario, context.persona or "-", result.target.id, result.latency_ms,
+                )
+                # Non-streaming fallback result → convert to SSE stream.
+                # Yield role+content as separate chunks to simulate streaming.
+                message = result.body.get("choices", [{}])[0].get("message", {})
+                if message.get("role"):
+                    yield _normalize_stream_chunk(
+                        {"choices": [{"delta": {"role": message["role"]}, "finish_reason": None}]},
+                        result.target.model,
+                    )
+                if message.get("content"):
+                    yield _normalize_stream_chunk(
+                        {"choices": [{"delta": {"content": message["content"]}, "finish_reason": None}]},
+                        result.target.model,
+                    )
+                yield _normalize_stream_chunk(
+                    {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+                    result.target.model,
+                )
+                return
+            # _race_stream succeeded: yield the first chunk from the winner,
+            # then continue streaming from the winner's iterator.
             self._stream_result = result
             self.store.record_decision(
                 session_id, context.scenario, context.persona, result.target.id,
                 result.latency_ms, True,
             )
             log.info(
-                "route scenario=%s persona=%s target=%s latency_ms=%.1f (stream fallback)",
+                "route scenario=%s persona=%s target=%s latency_ms=%.1f (stream race)",
                 context.scenario, context.persona or "-", result.target.id, result.latency_ms,
             )
-            # Non-streaming fallback result → single SSE chunk
-            yield _normalize_stream_chunk(result.body, result.target.model)
+            # The winner's first chunk was already consumed by _race_stream;
+            # yield it, then continue from the winner's iterator.
+            winner_iterator = self._race_winner_iterator
+            if winner_iterator is not None:
+                yield self._race_first_chunk
+                async for chunk in winner_iterator:
+                    yield chunk
+                # If the winner's stream ended without a finish_reason, add one
+                # so clients know the stream is complete.
+                if self._race_first_chunk and self._race_first_chunk.get("choices"):
+                    last_finish = self._race_first_chunk["choices"][0].get("finish_reason")
+                    if not last_finish:
+                        yield _normalize_stream_chunk(
+                            {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+                            result.target.model,
+                        )
             return
 
         # Phase 1 succeeded: yield first chunk, then continue streaming
@@ -333,6 +331,8 @@ class ModelRouter:
         if not racing:
             return None
         self._raced_ids = {target.id for target in racing}
+        self._race_winner_iterator = None
+        self._race_first_chunk = None
         timeout = self.config.routing.parallel_fallback_timeout_seconds
 
         first_chunk_tasks: dict[asyncio.Task, TargetConfig] = {}
@@ -360,7 +360,7 @@ class ModelRouter:
                 for task in done:
                     target = first_chunk_tasks[task]
                     try:
-                        task.result()  # first chunk already consumed
+                        first_chunk = task.result()  # first chunk consumed
                     except UpstreamFailure as error:
                         failures.append(f"{target.id}: HTTP {error.status} {error}")
                         self.store.record_decision(
@@ -376,6 +376,8 @@ class ModelRouter:
                         continue
                     # Winner!
                     winner_target = target
+                    self._race_winner_iterator = iterators[winner_target]
+                    self._race_first_chunk = first_chunk
                     break
             if winner_target is None:
                 log.warning(

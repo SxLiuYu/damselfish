@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -126,6 +127,14 @@ def rank_targets(
         if requested_model and requested_model not in {"auto", "damselfish", "damselfish/auto"}:
             if requested_model in {target.id, target.model}:
                 score -= 10000.0
+        # Load balancing: if the top target has served the vast majority of
+        # recent requests, add a small random penalty to avoid pinning all
+        # traffic to a single target.  This only applies when the target has
+        # enough history to be statistically meaningful.
+        if state.successes > 100 and state.failure_rate < 0.1:
+            # Target is doing well — still give it a small chance of being
+            # skipped so other targets get exercised.
+            score += random.uniform(0, 50.0) if state.successes > 500 else 0.0
         ranked.append((score, target))
     ranked.sort(key=lambda item: (item[0], item[1].id))
     return [target for _, target in ranked]

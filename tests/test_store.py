@@ -175,3 +175,42 @@ def test_store_migrates_token_columns_on_existing_db(tmp_path: Path) -> None:
     store.record_usage("fast", prompt_tokens=50, completion_tokens=25, total_tokens=75)
     assert store.stats("fast").prompt_tokens == 50
     store.close()
+
+
+def test_store_prune_decisions(tmp_path: Path) -> None:
+    """prune_decisions removes old rows, keeping the most recent."""
+    store = Store(tmp_path / "router.db", ["fast"])
+    # Insert 100 decisions
+    for i in range(100):
+        store.record_decision("s1", "default", None, "fast", 100.0, True, 200, None)
+    assert len(store.recent_decisions(limit=200)) == 100
+    # Prune to keep only 10
+    deleted = store.prune_decisions(keep=10)
+    assert deleted == 90
+    remaining = store.recent_decisions(limit=200)
+    assert len(remaining) == 10
+    store.close()
+
+
+def test_store_prune_decisions_noop_when_small(tmp_path: Path) -> None:
+    """prune_decisions does nothing when table is under the keep limit."""
+    store = Store(tmp_path / "router.db", ["fast"])
+    store.record_decision("s1", "default", None, "fast", 100.0, True, 200, None)
+    deleted = store.prune_decisions(keep=5000)
+    assert deleted == 0
+    assert len(store.recent_decisions()) == 1
+    store.close()
+
+
+def test_store_update_session_messages_syncs_both_tables(tmp_path: Path) -> None:
+    """update_session_messages updates both project_sessions and sessions tables."""
+    store = Store(tmp_path / "router.db", ["fast"])
+    # Save a session in the default project (writes to both tables)
+    store.save_session("sess1", [{"role": "user", "content": "hello"}], 10)
+    # Compress: update messages
+    store.update_session_messages("sess1", [{"role": "system", "content": "summary"}])
+    # Both tables should reflect the update
+    msgs = store.get_session("sess1", ttl_days=30)
+    assert len(msgs) == 1
+    assert msgs[0]["content"] == "summary"
+    store.close()
