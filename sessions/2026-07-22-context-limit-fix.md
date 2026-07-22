@@ -17,6 +17,10 @@ Given: 70655 `inputs` tokens and 1024 `max_new_tokens`
 
 **根因**: 路由器 `rank_targets()` 只检查能力/场景匹配，未考虑模型上下文长度限制。
 
+### 附加发现：压缩机制形同虚设
+
+`_compress_conversation()` 硬编码了 `preferred_targets=("deepseek-v4-flash",)`，但该目标在北京服务器上**不存在**，导致压缩请求永远找不到目标，抛出异常后静默吃掉——对话从未被压缩。这是上下文超限的**重要诱因**：对话不断累积，却没有压缩机制兜底收缩。
+
 ## 修复方案（三层保护）
 
 | 层 | 机制 | 文件 |
@@ -43,16 +47,20 @@ return max(1, int(estimate * 1.1))
 
 ## 修改文件
 
+### 核心修复
 1. `damselfish/config.py` — `TargetConfig.max_context` 字段
 2. `damselfish/selector.py` — `RouteContext.estimated_input_tokens`，`rank_targets()` 过滤，CJK 感知估算
 3. `damselfish/router.py` — `_upstream_payload()` 封顶，`_is_context_overflow()`，`_max_new_tokens()`
 4. `damselfish/nodes.py` — `normalize_node()` 支持 `max_context`（更新时从 existing 继承）
 5. `scripts/sync_free_models.py` — `ZHIPU_CONTEXT_LIMITS`，`common_node(max_context=...)`
 
+### 压缩修复（第二轮）
+6. `damselfish/app.py` — 移除硬编码 `deepseek-v4-flash`，改用 auto-routing；中文 prompt；token 减少验证
+
 ## 测试
 
-- **36 个新测试**，覆盖 token 估算、max_context 过滤、安全封顶、400 回退、节点管理、端到端
-- **68 个测试全部通过**（本地 + 北京服务器）
+- **39 个新测试**，覆盖 token 估算、max_context 过滤、安全封顶、400 回退、节点管理、端到端、压缩
+- **71 个测试全部通过**（本地 + 北京服务器）
 
 ## 部署
 
@@ -66,8 +74,7 @@ return max(1, int(estimate * 1.1))
 ## Git 提交
 
 ```
-5452d2d docs: finalize session record with deployment confirmation
-beff054 docs: update session record with deployment status
+9aab01a fix: compression used nonexistent deepseek-v4-flash target, silently failing
 5fe5ac8 test: comprehensive context-limit fix tests (36 new tests, all 68 pass)
 10c47a5 fix: CJK-aware token estimation for accurate max_context filtering
 143eea2 fix: prevent context overflow 400 errors with max_context filtering and capping
@@ -75,7 +82,7 @@ beff054 docs: update session record with deployment status
 
 ## 结论
 
-使用 damselfish 的用户不会再遇到 `HTTP 400 inputs tokens + max_new_tokens must be <= 16384` 错误。三层保护确保：路由层提前过滤 → payload 自动封顶 → 400 错误兜底回退。
+使用 damselfish 的用户不会再遇到 `HTTP 400 inputs tokens + max_new_tokens must be <= 16384` 错误。三层保护确保：路由层提前过滤 → payload 自动封顶 → 400 错误兜底回退。压缩功能现已真正可用：不再硬编码不存在的目标，改用中文 prompt，并在压缩前验证 token 确实减少。
 
 ## 后续建议
 
