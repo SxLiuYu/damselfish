@@ -316,6 +316,8 @@ def create_app(config: AppConfig | None = None, config_path: str | Path | None =
             x_damselfish_project or extension.get("project_id") or "default",
             "project_id",
         )
+        if not session_id:
+            session_id = _derive_session_id(payload.get("messages", []))
         project_title = _title(
             x_damselfish_project_title or extension.get("project_title")
         )
@@ -625,6 +627,33 @@ async def _handle_streaming(
         stream_chunks(), media_type="text/event-stream", headers=headers
     )
 
+
+
+def _derive_session_id(messages: list[dict[str, Any]]) -> str | None:
+    """Derive a stable session id from the first user message.
+
+    Enables memory, context, and cloud sync for stateless clients (e.g.
+    agentic coding tools) that send the full conversation in each request
+    but omit ``X-Damselfish-Session`` headers.  The same opening user
+    message always maps to the same session id, so conversations stay
+    continuous across requests, devices, and agents.
+    """
+    first_user = next(
+        (m.get("content") for m in messages
+         if isinstance(m, dict) and m.get("role") == "user"),
+        None,
+    )
+    fingerprint = ""
+    if isinstance(first_user, str):
+        fingerprint = first_user.strip()[:2000]
+    elif isinstance(first_user, list):
+        fingerprint = " ".join(
+            p.get("text", "") for p in first_user
+            if isinstance(p, dict) and p.get("type") == "text"
+        ).strip()[:2000]
+    if not fingerprint:
+        return None
+    return hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()[:16]
 
 def _identifier(value: Any, name: str, optional: bool = False) -> str | None:
     if value is None and optional:

@@ -571,3 +571,75 @@ def test_health_endpoint_deep_check(tmp_path: Path) -> None:
     assert "healthy_targets" in data
     assert "total_targets" in data
     assert data["total_targets"] >= 1
+
+def test_auto_derived_session_id_enables_memory(tmp_path: Path, monkeypatch) -> None:
+    """When no session_id is sent, it is auto-derived from the first user
+    message so memory, context, and cloud sync work for stateless clients
+    (agentic coding tools) that omit session headers."""
+    target = TargetConfig(
+        "local", "Local", "http://unused/v1", "local-model", local=True, probe=False
+    )
+    config = AppConfig(
+        host="127.0.0.1",
+        port=18086,
+        database=tmp_path / "app.db",
+        routing=RoutingConfig(),
+        targets=(target,),
+    )
+    seen: list[str | None] = []
+
+    async def complete(self, payload, context, session_id):
+        seen.append(session_id)
+        body = {
+            "id": "completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "got it"},
+                    "finish_reason": "stop",
+                }
+            ],
+        }
+        return CompletionResult(body=body, target=target, latency_ms=1.0)
+
+    monkeypatch.setattr(ModelRouter, "complete", complete)
+    app = create_app(config)
+    with TestClient(app) as client:
+        first = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "damselfish/auto",
+                "messages": [{"role": "user", "content": "remember 42"}],
+            },
+        )
+        second = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "damselfish/auto",
+                "messages": [
+                    {"role": "user", "content": "remember 42"},
+                    {"role": "assistant", "content": "got it"},
+                    {"role": "user", "content": "what was it?"},
+                ],
+            },
+        )
+        diff = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "damselfish/auto",
+                "messages": [{"role": "user", "content": "different topic"}],
+            },
+        )
+        projects = client.get("/v1/memory/projects").json()["data"]
+
+    assert first.status_code == 200
+    assert first.headers["X-Damselfish-Session"] is not None
+    # Same opening message -> same auto-derived session id
+    assert first.headers["X-Damselfish-Session"] == second.headers["X-Damselfish-Session"]
+    # Different opening message -> different session id
+    assert diff.headers["X-Damselfish-Session"] != first.headers["X-Damselfish-Session"]
+    # Decision tracking received a non-None session
+    assert seen[0] is not None and "/" in seen[0]
+    # Memory was active: sessions were saved
+    assert len(projects) >= 1
+    assert projects[0]["session_count"] >= 1
