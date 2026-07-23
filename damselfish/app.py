@@ -77,7 +77,13 @@ def create_app(config: AppConfig | None = None, config_path: str | Path | None =
                 log.warning("graceful shutdown timed out after 10s, forcing exit")
                 probe_task.cancel()
                 sync_task.cancel()
-            await memory_sync.sync_pending(force=True)
+            try:
+                await asyncio.wait_for(
+                    memory_sync.sync_pending(force=True),
+                    timeout=15.0,
+                )
+            except TimeoutError:
+                log.warning("final memory sync timed out, will resume on next startup")
             await client.aclose()
             store.close()
 
