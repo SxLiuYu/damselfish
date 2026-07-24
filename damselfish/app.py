@@ -258,6 +258,7 @@ def create_app(config: AppConfig | None = None, config_path: str | Path | None =
             "healthy_targets": healthy_targets,
             "total_targets": len(loaded.targets),
             "memory_sync": request.app.state.memory_sync.status(),
+            "disk": await asyncio.to_thread(get_disk_report, ["/"]),
         }
 
     @app.get("/stats")
@@ -278,6 +279,24 @@ def create_app(config: AppConfig | None = None, config_path: str | Path | None =
             "recent_decisions": request.app.state.store.recent_decisions(),
             "memory_sync": request.app.state.memory_sync.status(),
         }
+
+    @app.get("/admin/api/monitor/disk")
+    async def admin_monitor_disk(request: Request) -> dict[str, Any]:
+        """Current disk usage snapshot."""
+        return get_disk_report(["/"])
+
+    @app.post("/admin/api/monitor/cleanup")
+    async def admin_monitor_cleanup(request: Request) -> dict[str, Any]:
+        """Trigger disk cleanup."""
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            body = {}
+        dirs = body.get("dirs", ["/"])
+        max_age = body.get("max_age_days", 30)
+        max_size = body.get("max_size_bytes")
+        dry_run = body.get("dry_run", True)
+        return disk_cleanup(dirs, max_age=max_age, max_size=max_size, dry_run=dry_run)
 
     @app.get("/v1/models")
     async def models() -> dict[str, Any]:
