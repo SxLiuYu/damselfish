@@ -8,6 +8,7 @@ import os
 import re
 import socket
 import subprocess
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,7 +26,7 @@ class GitMemorySync:
         self.store = store
         self.repository = config.repository.expanduser().resolve()
         self.device_id = config.device_id.strip() or _default_device_id()
-        self._lock = asyncio.Lock()
+        self._sync_lock = threading.Lock()
         self._last_pull_at = 0.0
         self._last_push_at = 0.0
         self._last_error: str | None = None
@@ -38,32 +39,28 @@ class GitMemorySync:
     async def startup_sync(self) -> None:
         if not self.enabled:
             return
-        async with self._lock:
-            await asyncio.to_thread(self._startup_sync)
+        await asyncio.to_thread(self._startup_sync)
 
     async def pull_if_due(self, force: bool = False) -> bool:
         if not self.enabled:
             return False
         if not force and time.time() - self._last_pull_at < self.config.pull_interval_seconds:
             return True
-        async with self._lock:
-            if not force and time.time() - self._last_pull_at < self.config.pull_interval_seconds:
-                return True
-            return await asyncio.to_thread(self._pull_and_import)
+        if not force and time.time() - self._last_pull_at < self.config.pull_interval_seconds:
+            return True
+        return await asyncio.to_thread(self._pull_and_import)
 
     async def sync_pending(self, force: bool = False) -> bool:
         if not self.enabled or (not force and not self.config.push_on_write):
             return False
-        async with self._lock:
-            return await asyncio.to_thread(self._sync_pending)
+        return await asyncio.to_thread(self._sync_pending)
 
     async def sync_now(self) -> bool:
         if not self.enabled:
             return False
-        async with self._lock:
-            pulled = await asyncio.to_thread(self._pull_and_import)
-            pushed = await asyncio.to_thread(self._sync_pending)
-            return pulled and pushed
+        pulled = await asyncio.to_thread(self._pull_and_import)
+        pushed = await asyncio.to_thread(self._sync_pending)
+        return pulled and pushed
 
     async def sync_loop(self, stop: asyncio.Event) -> None:
         if not self.enabled:
@@ -96,6 +93,10 @@ class GitMemorySync:
         return "synced" if self.store.pending_memory_event_count() == 0 else "pending"
 
     def _startup_sync(self) -> None:
+        with self._sync_lock:
+            self._do_startup_sync()
+
+    def _do_startup_sync(self) -> None:
         try:
             self._ensure_repository()
             self._pull_and_import(ensure=False)
@@ -104,6 +105,10 @@ class GitMemorySync:
             self._record_error(error)
 
     def _pull_and_import(self, ensure: bool = True) -> bool:
+        with self._sync_lock:
+            return self._do_pull_and_import(ensure)
+
+    def _do_pull_and_import(self, ensure: bool = True) -> bool:
         try:
             if ensure:
                 self._ensure_repository()
@@ -119,6 +124,10 @@ class GitMemorySync:
             return False
 
     def _sync_pending(self, ensure: bool = True) -> bool:
+        with self._sync_lock:
+            return self._do_sync_pending(ensure)
+
+    def _do_sync_pending(self, ensure: bool = True) -> bool:
         try:
             if ensure:
                 self._ensure_repository()
