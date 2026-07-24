@@ -1,4 +1,4 @@
-server:
+﻿server:
   host: 127.0.0.1
   port: 8086
 
@@ -54,13 +54,13 @@ scenarios:
 
 personas:
   developer:
-    keywords: ["软件工程师", "开发者", "programmer", "developer"]
+    keywords: ["杞欢宸ョ▼甯?, "寮€鍙戣€?, "programmer", "developer"]
     preferred: [coding, tools]
   operator:
-    keywords: ["运维工程师", "devops", "sre"]
+    keywords: ["杩愮淮宸ョ▼甯?, "devops", "sre"]
     preferred: [coding, tools, reasoning]
   writer:
-    keywords: ["作家", "文案", "writer"]
+    keywords: ["浣滃", "鏂囨", "writer"]
     preferred: [creative, multilingual]
 
 targets:
@@ -98,6 +98,18 @@ targets:
     probe: false
 
   - id: glm-4.7-flash
+
+# === Cloud Memory (跨设备同步) ===
+cloud_memory:
+  enabled: false          # 启用云端记忆同步，多设备会话无缝衔接
+  url: ""                 # 远程 Damselfish 实例地址，如 https://123.57.107.21:8088/damselfish
+  api_key: ""             # 远程服务器 API key（与 DAMSELFISH_API_KEY 一致）
+  push_interval: 30       # 本地推送到云端间隔（秒）
+  pull_interval: 30       # 从云端拉取新事件间隔（秒）
+  device_id_env: DAMSELFISH_DEVICE_ID
+  batch_size: 100
+  max_snapshot_chars: 50000
+  mode: push_pull         # push_only / pull_only / push_pull
     label: GLM 4.7 Flash
     base_url: https://open.bigmodel.cn/api/paas/v4
     model: glm-4.7-flash

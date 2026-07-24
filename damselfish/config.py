@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
@@ -82,6 +82,9 @@ class RoutingConfig:
     memory_compression_keep: int = 10
     parallel_fallback_count: int = 3
     parallel_fallback_timeout_seconds: float = 30.0
+    # Usage tracking thresholds
+    usage_cost_per_1m_tokens: dict[str, float] = field(default_factory=dict)
+    daily_usage_token_limit: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,6 +110,38 @@ class GitSyncConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class CloudMemoryConfig:
+    """Configuration for cross-device cloud memory sync."""
+    enabled: bool = False
+    url: str = ""
+    api_key: str = ""
+    api_key_env: str | None = None
+    push_interval: float = 30.0
+    pull_interval: float = 30.0
+    device_id_env: str = "DAMSELFISH_DEVICE_ID"
+    batch_size: int = 100
+    max_snapshot_chars: int = 50000
+    mode: str = "push_pull"
+
+    @property
+    def api_key_value(self) -> str:
+        if self.api_key:
+            return self.api_key
+        if self.api_key_env:
+            return os.environ.get(self.api_key_env, "")
+        return ""
+
+    @property
+    def device_id(self) -> str:
+        return os.environ.get(self.device_id_env, "") or ""
+
+    @property
+    def base_url(self) -> str:
+        url = self.url.rstrip("/")
+        return url if url.endswith("/") else f"{url}/"
+
+
+@dataclass(frozen=True, slots=True)
 class AppConfig:
     host: str
     port: int
@@ -114,6 +149,7 @@ class AppConfig:
     routing: RoutingConfig
     targets: tuple[TargetConfig, ...]
     git_sync: GitSyncConfig = GitSyncConfig()
+    cloud_memory: CloudMemoryConfig = CloudMemoryConfig()
     scenarios: dict[str, RouteRule] = field(default_factory=dict)
     personas: dict[str, PersonaRule] = field(default_factory=dict)
     managed_nodes_file: Path | None = None
@@ -169,6 +205,32 @@ def _load_managed_targets(path: Path) -> tuple[TargetConfig, ...]:
     return tuple(target_from_mapping(item, managed=True) for item in nodes)
 
 
+def _parse_routing_config(raw: dict[str, Any] | None) -> RoutingConfig:
+    if not raw:
+        return RoutingConfig()
+    valid_keys = {f.name for f in fields(RoutingConfig)}
+    filtered = {k: v for k, v in raw.items() if k in valid_keys}
+    return RoutingConfig(**filtered)
+
+
+def _parse_git_sync_config(raw: dict[str, Any] | None) -> GitSyncConfig:
+    if not raw:
+        return GitSyncConfig()
+    valid_keys = {f.name for f in fields(GitSyncConfig)}
+    filtered = {k: v for k, v in raw.items() if k in valid_keys}
+    repository = Path(filtered.pop("repository", "./data/memory-repo")).expanduser()
+    filtered["repository"] = repository
+    return GitSyncConfig(**filtered)
+
+
+def _parse_cloud_memory_config(raw: dict[str, Any] | None) -> CloudMemoryConfig:
+    if not raw:
+        return CloudMemoryConfig()
+    valid_keys = {f.name for f in fields(CloudMemoryConfig)}
+    filtered = {k: v for k, v in raw.items() if k in valid_keys}
+    return CloudMemoryConfig(**filtered)
+
+
 def load_config(path: str | Path | None = None) -> AppConfig:
     config_path = Path(
         path or os.environ.get("DAMSELFISH_CONFIG", "config.yml")
@@ -177,13 +239,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         raw = yaml.safe_load(handle) or {}
 
     routing_raw = raw.get("routing", {})
-    routing = RoutingConfig(
-        **{
-            key: value
-            for key, value in routing_raw.items()
-            if key in RoutingConfig.__dataclass_fields__
-        }
-    )
+    routing = _parse_routing_config(routing_raw)
     base_targets = tuple(target_from_mapping(item) for item in raw.get("targets", []))
     database = Path(raw.get("database", "./data/damselfish.db")).expanduser()
     if not database.is_absolute():
@@ -219,22 +275,16 @@ def load_config(path: str | Path | None = None) -> AppConfig:
     }
     sync_raw = raw.get("git_sync", {}) or {}
     repository = Path(sync_raw.get("repository", "./data/memory-repo")).expanduser()
-    if not repository.is_absolute():
+    if repository.is_absolute():
+        repository = repository
+    else:
         repository = (config_path.parent / repository).resolve()
-    git_sync = GitSyncConfig(
-        enabled=bool(sync_raw.get("enabled", False)),
-        repository=repository,
-        remote_url_env=str(
-            sync_raw.get("remote_url_env", "DAMSELFISH_MEMORY_GIT_URL")
-        ),
-        branch=str(sync_raw.get("branch", "main")),
-        pull_interval_seconds=float(sync_raw.get("pull_interval_seconds", 30)),
-        push_retries=max(int(sync_raw.get("push_retries", 3)), 1),
-        push_on_write=bool(sync_raw.get("push_on_write", True)),
-        author_name=str(sync_raw.get("author_name", "Damselfish Memory")),
-        author_email=str(sync_raw.get("author_email", "damselfish@localhost")),
-        device_id_env=str(sync_raw.get("device_id_env", "DAMSELFISH_DEVICE_ID")),
-    )
+    git_sync = _parse_git_sync_config(sync_raw)
+    # Override repository if explicitly set in sync_raw
+    if "repository" in sync_raw:
+        git_sync = git_sync.replace(repository=repository)
+    cloud_raw = raw.get("cloud_memory", {}) or {}
+    cloud_memory = _parse_cloud_memory_config(cloud_raw)
     server = raw.get("server", {})
     return AppConfig(
         host=str(server.get("host", "127.0.0.1")),
@@ -243,6 +293,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         routing=routing,
         targets=targets,
         git_sync=git_sync,
+        cloud_memory=cloud_memory,
         scenarios=scenarios,
         personas=personas,
         managed_nodes_file=managed_nodes_file,

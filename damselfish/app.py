@@ -32,6 +32,7 @@ from .router import ModelRouter, NoTargetAvailable
 from .selector import infer_context, RouteContext
 from .store import Store, merge_messages, project_context_message
 from .monitor import get_disk_report, cleanup as disk_cleanup
+from .cloud_memory import CloudMemorySync
 
 log = logging.getLogger("damselfish")
 
@@ -55,13 +56,16 @@ def create_app(config: AppConfig | None = None, config_path: str | Path | None =
         router = ModelRouter(loaded, store, client)
         memory_sync = GitMemorySync(loaded.git_sync, store)
         await memory_sync.startup_sync()
+        cloud_sync = CloudMemorySync(loaded.cloud_memory, store)
+        await cloud_sync.start()
         stop = asyncio.Event()
         probe_task = asyncio.create_task(router.probe_loop(stop))
         sync_task = asyncio.create_task(memory_sync.sync_loop(stop))
         app.state.config = loaded
         app.state.store = store
         app.state.router = router
-        app.state.memory_sync = memory_sync
+        app.state.git_sync = memory_sync
+        app.state.cloud_sync = cloud_sync
         app.state.started_at = time.time()
         app.state.node_store = node_store
         try:
@@ -85,6 +89,10 @@ def create_app(config: AppConfig | None = None, config_path: str | Path | None =
                 )
             except TimeoutError:
                 log.warning("final memory sync timed out, will resume on next startup")
+            try:
+                await cloud_sync.stop()
+            except Exception:
+                log.warning("cloud sync shutdown failed")
             await client.aclose()
             store.close()
 
@@ -258,13 +266,18 @@ def create_app(config: AppConfig | None = None, config_path: str | Path | None =
             "available_targets": available_targets,
             "healthy_targets": healthy_targets,
             "total_targets": len(loaded.targets),
-            "memory_sync": request.app.state.memory_sync.status(),
+            "memory_sync": request.app.state.git_sync.status(),
             "disk": await asyncio.to_thread(get_disk_report, ["/"]),
         }
 
     @app.get("/stats")
     async def stats(request: Request) -> dict[str, Any]:
         states = request.app.state.store.all_stats()
+        total_prompt = sum(s.prompt_tokens for s in states.values())
+        total_completion = sum(s.completion_tokens for s in states.values())
+        total_tokens = sum(s.total_tokens for s in states.values())
+        total_success = sum(s.successes for s in states.values())
+        total_failures = sum(s.failures for s in states.values())
         return {
             "targets": {
                 target.id: {
@@ -278,7 +291,16 @@ def create_app(config: AppConfig | None = None, config_path: str | Path | None =
                 for target in loaded.targets
             },
             "recent_decisions": request.app.state.store.recent_decisions(),
-            "memory_sync": request.app.state.memory_sync.status(),
+            "summary": {
+                "total_requests": total_success + total_failures,
+                "total_success": total_success,
+                "total_failures": total_failures,
+                "success_rate": round(total_success / max(total_success + total_failures, 1) * 100, 1),
+                "total_tokens": total_tokens,
+                "total_prompt_tokens": total_prompt,
+                "total_completion_tokens": total_completion,
+            },
+            "memory_sync": request.app.state.git_sync.status(),
         }
 
     @app.get("/admin/api/monitor/disk")
@@ -358,7 +380,7 @@ def create_app(config: AppConfig | None = None, config_path: str | Path | None =
         history = []
         transcript = list(incoming)
         if memory_enabled:
-            await request.app.state.memory_sync.pull_if_due()
+            await request.app.state.git_sync.pull_if_due()
             history = request.app.state.store.get_project_session(
                 project_id, session_id, loaded.routing.memory_ttl_days
             )
@@ -407,9 +429,9 @@ def create_app(config: AppConfig | None = None, config_path: str | Path | None =
                 project_id=project_id,
                 project_title=project_title,
                 session_title=session_title,
-                source_device=request.app.state.memory_sync.device_id,
+                source_device=request.app.state.git_sync.device_id,
             )
-            await request.app.state.memory_sync.sync_pending()
+            await request.app.state.git_sync.sync_pending()
             # Background compression for long conversations
             if len(transcript) + 1 > loaded.routing.memory_compression_threshold:
                 asyncio.create_task(_compress_conversation(
@@ -423,7 +445,7 @@ def create_app(config: AppConfig | None = None, config_path: str | Path | None =
             "X-Damselfish-Latency-Ms": f"{result.latency_ms:.1f}",
             "X-Damselfish-Scenario": context.scenario,
             "X-Damselfish-Project": project_id,
-            "X-Damselfish-Memory-Sync": request.app.state.memory_sync.response_status(),
+            "X-Damselfish-Memory-Sync": request.app.state.git_sync.response_status(),
         }
         if session_id:
             headers["X-Damselfish-Session"] = session_id
@@ -431,19 +453,19 @@ def create_app(config: AppConfig | None = None, config_path: str | Path | None =
 
     @app.get("/v1/memory/projects")
     async def memory_projects(request: Request) -> dict[str, Any]:
-        await request.app.state.memory_sync.pull_if_due()
+        await request.app.state.git_sync.pull_if_due()
         return {"data": request.app.state.store.list_projects()}
 
     @app.get("/v1/memory/projects/{project_id}/sessions")
     async def memory_sessions(project_id: str, request: Request) -> dict[str, Any]:
-        await request.app.state.memory_sync.pull_if_due()
+        await request.app.state.git_sync.pull_if_due()
         return {"data": request.app.state.store.list_project_sessions(project_id)}
 
     @app.get("/v1/memory/projects/{project_id}/sessions/{session_id}")
     async def memory_session(
         project_id: str, session_id: str, request: Request
     ) -> dict[str, Any]:
-        await request.app.state.memory_sync.pull_if_due()
+        await request.app.state.git_sync.pull_if_due()
         messages = request.app.state.store.get_project_session(
             project_id, session_id, loaded.routing.memory_ttl_days
         )
@@ -457,9 +479,74 @@ def create_app(config: AppConfig | None = None, config_path: str | Path | None =
 
     @app.post("/v1/memory/sync")
     async def memory_sync(request: Request) -> dict[str, Any]:
-        success = await request.app.state.memory_sync.sync_now()
-        status = request.app.state.memory_sync.status()
+        success = await request.app.state.git_sync.sync_now()
+        status = request.app.state.git_sync.status()
         return {"success": success, **status}
+
+    # --- Cloud Memory API endpoints ---
+
+    @app.get("/admin/api/cloud_memory/status")
+    async def cloud_memory_status(request: Request) -> dict[str, Any]:
+        """Get cloud memory sync status."""
+        cs = getattr(request.app.state, "cloud_sync", None)
+        if cs is None:
+            return {"enabled": False, "error": "not initialized"}
+        try:
+            return await cs.status()
+        except Exception as e:
+            return {"enabled": False, "error": str(e)}
+
+    @app.post("/admin/api/cloud_memory/push")
+    async def cloud_memory_push(request: Request) -> dict[str, Any]:
+        """Force push pending local memories to cloud."""
+        cs = getattr(request.app.state, "cloud_sync", None)
+        if cs is None:
+            return {"status": "skipped", "reason": "not enabled"}
+        try:
+            result = await cs.push_pending()
+            return result
+        except Exception as e:
+            log.warning("cloud push failed", exc_info=True)
+            return {"status": "error", "message": str(e)}
+
+    @app.post("/admin/api/cloud_memory/pull")
+    async def cloud_memory_pull(request: Request) -> dict[str, Any]:
+        """Force pull memories from cloud."""
+        cs = getattr(request.app.state, "cloud_sync", None)
+        if cs is None:
+            return {"status": "skipped", "reason": "not enabled"}
+        try:
+            result = await cs.pull_remote()
+            return result
+        except Exception as e:
+            log.warning("cloud pull failed", exc_info=True)
+            return {"status": "error", "message": str(e)}
+
+    # --- Usage Tracking Endpoints ---
+
+    @app.get("/admin/api/usage/tokens")
+    async def usage_token_stats(request: Request) -> dict[str, Any]:
+        """Token usage statistics per target."""
+        states = request.app.state.store.all_stats()
+        return {
+            "targets": {
+                tid: {
+                    "prompt_tokens": s.prompt_tokens,
+                    "completion_tokens": s.completion_tokens,
+                    "total_tokens": s.total_tokens,
+                    "requests": s.requests,
+                    "successes": s.successes,
+                    "failures": s.failures,
+                }
+                for tid, s in states.items()
+            },
+            "summary": {
+                "total_prompt_tokens": sum(s.prompt_tokens for s in states.values()),
+                "total_completion_tokens": sum(s.completion_tokens for s in states.values()),
+                "total_tokens": sum(s.total_tokens for s in states.values()),
+                "total_requests": sum(s.requests for s in states.values()),
+            },
+        }
 
     return app
 
@@ -632,9 +719,9 @@ async def _handle_streaming(
                 project_id=project_id,
                 project_title=project_title,
                 session_title=session_title,
-                source_device=request.app.state.memory_sync.device_id,
+                source_device=request.app.state.git_sync.device_id,
             )
-            await request.app.state.memory_sync.sync_pending()
+            await request.app.state.git_sync.sync_pending()
             if len(transcript) + 1 > loaded.routing.memory_compression_threshold:
                 asyncio.create_task(_compress_conversation(
                     request.app.state.store, request.app.state.router,
@@ -645,7 +732,7 @@ async def _handle_streaming(
     headers = {
         "X-Damselfish-Scenario": context.scenario,
         "X-Damselfish-Project": project_id,
-        "X-Damselfish-Memory-Sync": request.app.state.memory_sync.response_status(),
+        "X-Damselfish-Memory-Sync": request.app.state.git_sync.response_status(),
     }
     if session_id:
         headers["X-Damselfish-Session"] = session_id
