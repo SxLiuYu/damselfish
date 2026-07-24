@@ -26,7 +26,7 @@ class GitMemorySync:
         self.store = store
         self.repository = config.repository.expanduser().resolve()
         self.device_id = config.device_id.strip() or _default_device_id()
-        self._sync_lock = threading.Lock()
+        self._sync_lock = threading.RLock()
         self._last_pull_at = 0.0
         self._last_push_at = 0.0
         self._last_error: str | None = None
