@@ -175,7 +175,23 @@ async def test_node(client: httpx.AsyncClient, target: TargetConfig) -> dict[str
             },
         )
         latency_ms = (time.monotonic() - started) * 1000
-        if not response.is_success:
+        if response.status_code == 404:
+            # Many upstreams (e.g. Finna/GLM API) don't support /models endpoint
+            # but work fine with /chat/completions — use configured model ID
+            fallback_models = []
+            if target.model:
+                fallback_models.append(
+                    {"id": target.model, "name": target.label or target.id}
+                )
+            return {
+                "success": True,
+                "status": 200,
+                "latency_ms": round(latency_ms, 1),
+                "message": f"Models endpoint unavailable ({response.status_code}); using configured model '{target.model}'",
+                "models": [m["id"] for m in fallback_models],
+                "model_details": fallback_models,
+            }
+        elif not response.is_success:
             return {
                 "success": False,
                 "status": response.status_code,
