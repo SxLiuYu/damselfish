@@ -431,7 +431,7 @@ class ModelRouter:
         request, capped = _upstream_payload(payload, target, probe)
         if capped:
             self.store.record_cap(target.id)
-        headers = {"Content-Type": "application/json"}
+        headers = {**UPSTREAM_HEADERS, "Content-Type": "application/json"}
         if target.api_key:
             headers["Authorization"] = f"Bearer {target.api_key}"
         started = time.monotonic()
@@ -484,7 +484,11 @@ class ModelRouter:
         if capped:
             self.store.record_cap(target.id)
         request["stream"] = True
-        headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}
+        headers = {
+            **UPSTREAM_HEADERS,
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream, application/json;q=0.9, */*;q=0.8",
+        }
         if target.api_key:
             headers["Authorization"] = f"Bearer {target.api_key}"
         _first_yielded = False
@@ -630,6 +634,22 @@ UPSTREAM_FIELDS = {
     "messages", "tools", "tool_choice", "temperature", "top_p", "max_tokens",
     "max_completion_tokens", "stop", "response_format", "seed",
     "presence_penalty", "frequency_penalty", "parallel_tool_calls", "n", "user",
+}
+
+
+# Browser-like default headers to avoid being blocked by upstream WAFs
+# (e.g. Finna / Chinese cloud providers) that flag the default httpx
+# ``python-httpx/x.y`` User-Agent.
+UPSTREAM_HEADERS: dict[str, str] = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/126.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
 }
 
 

@@ -12,6 +12,21 @@ import httpx
 
 from .config import TargetConfig, target_from_mapping
 
+
+# Browser-like default headers mirroring ``router.UPSTREAM_HEADERS`` so that
+# node test/discovery requests are not flagged by upstream WAFs (e.g. Finna)
+# that block the default httpx User-Agent.
+_UPSTREAM_HEADERS: dict[str, str] = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/126.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+}
+
+
 _NODE_ID = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,79}$")
 _ALLOWED_CAPABILITIES = {
     "chat", "chinese", "multilingual", "tools", "coding", "reasoning",
@@ -158,7 +173,7 @@ def public_node(target: TargetConfig, *, managed: bool) -> dict[str, Any]:
 
 
 async def test_node(client: httpx.AsyncClient, target: TargetConfig) -> dict[str, Any]:
-    headers = {"Content-Type": "application/json"}
+    headers = {**_UPSTREAM_HEADERS, "Content-Type": "application/json"}
     if target.api_key:
         headers["Authorization"] = f"Bearer {target.api_key}"
     started = time.monotonic()
@@ -248,7 +263,7 @@ async def test_node(client: httpx.AsyncClient, target: TargetConfig) -> dict[str
 
 
 async def discover_models(client: httpx.AsyncClient, target: TargetConfig) -> dict[str, Any]:
-    headers: dict[str, str] = {}
+    headers: dict[str, str] = {**_UPSTREAM_HEADERS}
     if target.api_key:
         headers["Authorization"] = f"Bearer {target.api_key}"
     base = target.base_url.rstrip("/")
