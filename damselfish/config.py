@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import json
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 from typing import Any
 
@@ -287,7 +287,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
     git_sync = _parse_git_sync_config(sync_raw)
     # Override repository if explicitly set in sync_raw
     if "repository" in sync_raw:
-        git_sync = git_sync.replace(repository=repository)
+        git_sync = replace(git_sync, repository=repository)
     cloud_raw = raw.get("cloud_memory", {}) or {}
     cloud_memory = _parse_cloud_memory_config(cloud_raw)
     server = raw.get("server", {})
