@@ -82,6 +82,11 @@ class RoutingConfig:
     memory_compression_keep: int = 10
     parallel_fallback_count: int = 3
     parallel_fallback_timeout_seconds: float = 30.0
+    # Auto-disable: targets with >= this many consecutive failures are
+    # dynamically disabled until health check recovers.
+    auto_disable_consecutive_failures: int = 10
+    # How often to probe disabled targets for recovery.
+    health_check_interval_seconds: float = 60.0
     # Usage tracking thresholds
     usage_cost_per_1m_tokens: dict[str, float] = field(default_factory=dict)
     daily_usage_token_limit: int | None = None

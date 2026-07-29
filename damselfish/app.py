@@ -60,6 +60,7 @@ def create_app(config: AppConfig | None = None, config_path: str | Path | None =
         await cloud_sync.start()
         stop = asyncio.Event()
         probe_task = asyncio.create_task(router.probe_loop(stop))
+        health_task = asyncio.create_task(router.health_check_loop(stop))
         sync_task = asyncio.create_task(memory_sync.sync_loop(stop))
         app.state.config = loaded
         app.state.store = store
@@ -75,12 +76,13 @@ def create_app(config: AppConfig | None = None, config_path: str | Path | None =
             # Give in-flight requests up to 10 seconds to finish gracefully.
             try:
                 await asyncio.wait_for(
-                    asyncio.gather(probe_task, sync_task),
+                    asyncio.gather(probe_task, health_task, sync_task),
                     timeout=10.0,
                 )
             except TimeoutError:
                 log.warning("graceful shutdown timed out after 10s, forcing exit")
                 probe_task.cancel()
+                health_task.cancel()
                 sync_task.cancel()
             try:
                 await asyncio.wait_for(

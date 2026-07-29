@@ -53,6 +53,10 @@ class ModelRouter:
         # can continue streaming after the race succeeds.
         self._race_winner_iterator: AsyncIterator[dict] | None = None
         self._race_first_chunk: dict[str, Any] | None = None
+        # Auto-disable: targets dynamically disabled by health check.
+        self._auto_disabled: set[str] = set()
+        # Auto-enable: config-disabled targets re-enabled by health check.
+        self._auto_enabled: set[str] = set()
 
     def reconfigure(self, config: AppConfig) -> None:
         self.config = config
@@ -76,6 +80,10 @@ class ModelRouter:
             str(payload.get("model", "auto")),
             max_new_tokens=_max_new_tokens(payload),
         )
+        targets = [
+            t for t in targets
+            if t.id not in self._auto_disabled or t.id in self._auto_enabled
+        ]
         if not targets:
             raise NoTargetAvailable(
                 f"no healthy target has required capabilities: {sorted(context.required)}"
@@ -138,6 +146,10 @@ class ModelRouter:
             str(payload.get("model", "auto")),
             max_new_tokens=_max_new_tokens(payload),
         )
+        targets = [
+            t for t in targets
+            if t.id not in self._auto_disabled or t.id in self._auto_enabled
+        ]
         if not targets:
             raise NoTargetAvailable(
                 f"no healthy target has required capabilities: {sorted(context.required)}"
@@ -570,6 +582,15 @@ class ModelRouter:
     ) -> None:
         state = self.store.stats(target.id)
         count = state.consecutive_failures + 1
+        # Auto-disable if consecutive failures exceed threshold.
+        threshold = self.config.routing.auto_disable_consecutive_failures
+        if count >= threshold and target.id not in self._auto_disabled:
+            self._auto_disabled.add(target.id)
+            self._auto_enabled.discard(target.id)
+            log.warning(
+                "auto-disable target=%s consecutive_failures=%d >= %d",
+                target.id, count, threshold,
+            )
         if status == 429:
             delay = min(
                 self.config.routing.circuit_base_seconds * (2 ** max(count, 1)),
@@ -607,6 +628,58 @@ class ModelRouter:
             await self._call(target, payload, probe=True)
         except UpstreamFailure:
             return
+
+    async def _health_check(self, target: TargetConfig) -> None:
+        """Probe a disabled target for recovery.  On success, re-enable it."""
+        if not target.probe:
+            return
+        payload = {
+            "messages": [{"role": "user", "content": target.probe_prompt}],
+            "max_tokens": 4,
+        }
+        try:
+            await self._call(target, payload, probe=True)
+            was_disabled = target.id in self._auto_disabled
+            was_config_disabled = (
+                not target.enabled and target.id not in self._auto_enabled
+            )
+            self._auto_disabled.discard(target.id)
+            if was_config_disabled:
+                self._auto_enabled.add(target.id)
+                log.info(
+                    "auto-enable target=%s (config-disabled, health check passed)",
+                    target.id,
+                )
+            if was_disabled:
+                log.info(
+                    "auto-enable target=%s (auto-disabled, health check passed)",
+                    target.id,
+                )
+        except UpstreamFailure:
+            pass
+
+    async def health_check_loop(self, stop: asyncio.Event) -> None:
+        """Periodically probe disabled targets to check for recovery."""
+        while not stop.is_set():
+            candidates = [
+                t for t in self.config.targets
+                if t.probe and (
+                    t.id in self._auto_disabled
+                    or t.id in self._auto_enabled
+                    or not t.enabled
+                )
+            ]
+            if candidates:
+                await asyncio.gather(
+                    *(self._health_check(t) for t in candidates)
+                )
+            try:
+                await asyncio.wait_for(
+                    stop.wait(),
+                    timeout=self.config.routing.health_check_interval_seconds,
+                )
+            except TimeoutError:
+                pass
 
     async def probe_loop(self, stop: asyncio.Event) -> None:
         while not stop.is_set():
