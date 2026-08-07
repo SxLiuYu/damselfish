@@ -671,23 +671,9 @@ async def _handle_streaming(
                 # Track latency from first chunk
                 if not first_chunk_time:
                     first_chunk_time.append(time.monotonic())
-                # Inject meta event before the first data chunk so clients
-                # know which target/model is handling the stream (since SSE
-                # headers can't be added after the response starts).
-                if not first_meta_sent:
-                    result = getattr(router, "_stream_result", None)
-                    meta_target = result.target.id if result else ""
-                    meta_model = result.target.model if result else ""
-                    meta_latency = f"{result.latency_ms:.1f}" if result else "0.0"
-                    meta = {
-                        "target": meta_target,
-                        "model": meta_model,
-                        "latency_ms": meta_latency,
-                        "scenario": context.scenario,
-                    }
-                    yield f"event: meta\n"
-                    yield f"data: {json.dumps(meta, ensure_ascii=False)}\n\n"
-                    first_meta_sent = True
+                # Meta event removed for OpenAI SSE compatibility
+                # (OpenCode's openai-compatible provider doesn't understand custom events)
+                first_meta_sent = True
                 # Accumulate content for memory (with cap to avoid OOM on huge streams)
                 choices = chunk.get("choices", [])
                 if choices:
